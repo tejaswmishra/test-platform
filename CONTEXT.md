@@ -98,7 +98,11 @@ test-platform/
 
 8. **Database hosted on Neon (cloud), not local Postgres.** Enables developing from both home and office machines against the same data, since office PC can't push code but CAN read from the same cloud DB if `.env` is configured there too.
 
-9. **Connection pool sizing matters for the 500-concurrent-candidate target.** `pg.Pool({ max: 20, ... })` — not unlimited, not default. Combined with frontend auto-save every 15-30s (not per-keystroke), this keeps simultaneous DB writes manageable on modest server hardware. Node's event loop itself handles many concurrent I/O-bound connections fine even on weak hardware; the database connection pool is the actual constraint to tune.
+9. **Connection pool sizing matters for the 500-concurrent-candidate target.** `pg.Pool({ max: 20, ... })` — not unlimited, not default. Combined with frontend auto-save every 20s (not per-keystroke), this keeps simultaneous DB writes manageable on modest server hardware. Node's event loop itself handles many concurrent I/O-bound connections fine even on weak hardware; the database connection pool is the actual constraint to tune.
+
+10. **Option order is shuffled per-candidate too, same pattern as question order.** `attempts.option_order` is a JSONB map of `{ questionId: ['c','a','d','b'] }` — generated once at attempt creation, saved permanently, reused on resume. Critically, the frontend ALWAYS translates a clicked option back to its ORIGINAL letter before sending it to the backend — so `responses.selected_option` and all scoring logic never need to know shuffling exists at all. Shuffling is a presentation-only concern, fully contained in the browser.
+
+11. **Rate limiting applies ONLY to `/attempts/:id/answer`, never to `/submit` or `/events`.** Submit is a single critical action — rate-limiting it risks blocking a legitimate submission. The `answerLimiter` (20 req/min per IP) exists purely as a safety net against bugs/abuse, not something normal debounced auto-save (every 20s) should ever approach. Frontend treats a 429 the same as any other save failure — retries with backoff, never silently drops the pending answer.
 
 ## What's Done (backend — fully tested)
 
@@ -109,21 +113,61 @@ test-platform/
 - [x] validateAttempt anti-cheat middleware (ownership, status, server-timer with auto-submit)
 - [x] Seed script for default admin
 
-## What's Done (frontend — designed, NOT yet created as files)
+## What's Done (frontend — built AND verified working in browser)
 
-- [ ] `/login` page — candidate/employee toggle (code written, not yet saved to project)
-- [ ] `/admin/login` page (code written, not yet saved to project)
-- [ ] `/dashboard` page (code written, not yet saved to project)
-- [ ] `middleware.ts`, cookie-setting login API route, proxy route (all written, not yet saved to project)
+- [x] `/login` page — candidate/employee toggle, calls `/api/auth/login`, redirects to `/dashboard`
+- [x] `/admin/login` page — separate dark-styled page, not linked publicly
+- [x] `/dashboard` page — fetches `/tests/assigned`, renders pending/in-progress/completed sections, "Start Test" navigates to `/test/[attemptId]?testId=...`
+- [x] `middleware.ts` — verifies JWT cookie via `jose`, redirects to correct login page based on route + role
+- [x] `app/api/auth/login/route.ts` — proxies to Express, sets httpOnly cookie
+- [x] `app/api/auth/logout/route.ts` — deletes cookie
+- [x] `app/api/proxy/[...path]/route.ts` — forwards all other API calls, attaches Bearer token from cookie
+- [x] `hooks/useAntiCheat.js` — visibilitychange/blur/focus/beforeunload listeners
+- [x] **Test-taking page (`/test/[attemptId]`) — FULLY BUILT AND VERIFIED:**
+  - Question panel with 4 options (A-D), correctly shows shuffled option order per candidate
+  - Pagination grid in sidebar, color-coded by status (gray/green/purple/amber), clickable to jump questions
+  - Previous / Next / Clear Response / Mark for Review / Submit Test buttons all wired
+  - Auto-save on navigation + 20s interval + retry-on-failure logic
+  - Anti-cheat CONFIRMED WORKING LIVE: tab-switch and even a screenshot action triggered auto-submit correctly
+  - State persistence CONFIRMED: stopped mid-test, resumed, all previous answers + statuses correctly restored from `/attempts/:id/status`
+  - Timer renders in header (see KNOWN BUG below)
+
+## Known Bug — Timer shows 00:00 (not yet fixed, deprioritized for now)
+
+**Symptom:** Test page timer displays `00:00` instead of counting down from the test's actual `duration_minutes`.
+
+**Not yet root-caused.** Possible causes to check first when picking this up:
+1. `durationMinutes` state in `page.tsx` may not be getting set correctly from the `/start` response — check the line `setDurationMinutes(data.test?.duration_minutes || data.attempt.duration_minutes)`. Note `attempt` rows don't actually have a `duration_minutes` column (that lives on `tests`), so if `data.test` is ever undefined on a RESUME response specifically, this falls back to `undefined`, not a real number — this is the most likely root cause. Check the resume branch of `/attempts/start` on the backend — it currently returns `{ attempt, questions, optionOrder, resumed: true }` with NO `test` object included at all, only the fresh-start branch includes `test: { title, duration_minutes }`. This is almost certainly the bug — resume path needs to also return test duration.
+2. Confirm `started_at` is a valid timestamp string the frontend's `new Date(startedAt)` can parse correctly (we hit a timezone bug here before — see "Known Gotchas" below, this exact class of bug).
+3. Verify the test used for manual testing actually has a sane `duration_minutes` value (not 0 or null) in the database.
+
+**Fix path (likely):** Add `test: { title: test.title, duration_minutes: test.duration_minutes }` to the resume branch response in `POST /attempts/start`, mirroring what the fresh-start branch already returns. Needs a small additional query to fetch the test row in the resume branch (currently only fetched in fresh-start branch).
 
 ## What's NOT Started
 
-- [ ] Test-taking page (`/test/[attemptId]`) — question slides, pagination grid with 4-color status, timer UI, useAntiCheat hook
-- [ ] Admin: create test form (manual entry UI)
+- [ ] Admin dashboard/UI entirely — currently NO admin-facing pages exist (`/admin/dashboard`, create-test form, candidate list with "registered today" filter, responses table, terminate/reset buttons)
 - [ ] Admin: bulk Excel upload (backend route designed earlier in conversation, not yet built)
-- [ ] Admin: responses table view, terminate/reset attempt
 - [ ] Excel export of results (backend route designed earlier, not yet built)
-- [ ] Loading states, empty states, error boundaries throughout
+- [ ] Loading states, empty states, error boundaries — present in dashboard/test page, NOT yet audited across admin pages (since admin pages don't exist yet)
+- [ ] Office-PC-specific: local Postgres needs schema kept in sync with Neon (`option_order` column was added to Neon — confirm it's also run on local Postgres at office, since today's office session predates that schema addition)
+
+## TODOS for today (office, no AI/push access)
+
+1. **First priority — confirm local Postgres has `option_order` column.** Run in pgAdmin Query Tool:
+   ```sql
+   ALTER TABLE attempts ADD COLUMN IF NOT EXISTS option_order JSONB;
+   ```
+   This was added AFTER your last office session, so local Postgres is likely missing it. Without this, `/attempts/start` will throw a DB error on this machine specifically.
+
+2. **Re-verify the full candidate flow end-to-end on local Postgres**, same as you just did at home: login → dashboard → start test → answer/mark-for-review/navigate via grid → tab-switch triggers auto-submit → resume restores state correctly. This confirms the frontend work from tonight also works against the office's local DB, not just Neon.
+
+3. **Investigate the timer bug** (see above) — even without AI, you can read through `POST /attempts/start` in `attempts.js` and compare the fresh-start vs resume branches side by side. The fix is likely a one-line addition once you spot it. If you find and fix it, that's a clean win to bring home tonight.
+
+4. **Do NOT attempt to build admin UI today** — that's a larger, multi-file task better tackled with AI assistance at home tonight, not worth starting and abandoning half-built on a machine you can't push from.
+
+5. **Useful offline task: sketch the admin dashboard layout on paper** — what sections exist (candidate list, create test, assign, view responses), roughly how they're organized. This sets up tonight's AI-assisted build session with a clear plan already decided.
+
+6. **Document any NEW bugs found today** in this same style as the timer bug above — symptom, suspected cause, suggested fix path — so tonight's session starts with a clear list rather than vague memory of "something was off."
 
 ## Environment Variables
 
