@@ -5,10 +5,36 @@
 import express from 'express';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 import { validateAttempt, calculateScore } from '../middleware/antiCheat.js';
+import rateLimit from 'express-rate-limit';
 
 const router = express.Router();
 
-// POST /attempts/start  (unchanged from before)
+// Generous limit — this exists as a safety net against bugs or
+// scripted abuse, not something normal candidate behavior should
+// ever hit. With a 20-30s auto-save interval, legitimate use is
+// nowhere near this limit.
+const answerLimiter = rateLimit({
+  windowMs: 60 * 1000,  // 1 minute window
+  max: 20,                // 20 saves per minute per IP is very generous
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many save requests, please slow down' },
+});
+ 
+// Then apply it ONLY to the answer route, like this:
+//
+// router.patch(
+//   '/:attemptId/answer',
+//   answerLimiter,              // ← add this here
+//   requireAuth,
+//   requireRole('candidate', 'employee'),
+//   validateAttempt,
+//   async (req, res) => { ... }
+// );
+//
+// Do NOT add it to /submit or /events — those should never be
+// rate-limited, since submit is a single critical one-time action.
+
 router.post('/start', requireAuth, requireRole('candidate', 'employee'), async (req, res) => {
   const { pool } = req.app.locals;
   const userId = req.user.userId;
@@ -34,7 +60,7 @@ router.post('/start', requireAuth, requireRole('candidate', 'employee'), async (
       return res.status(403).json({ error: 'You have already submitted this test' });
     }
  
-    // ── Resume path — use the SAME saved order, never re-shuffle ──────
+    // ── Resume path — reuse the SAME saved question order AND option order ──
     const existingAttempt = await pool.query(
       `SELECT * FROM attempts WHERE test_id = $1 AND user_id = $2 AND submit_status = 'in_progress'`,
       [test_id, userId]
@@ -43,7 +69,12 @@ router.post('/start', requireAuth, requireRole('candidate', 'employee'), async (
     if (existingAttempt.rows.length > 0) {
       const attempt = existingAttempt.rows[0];
       const questions = await getQuestionsInOrder(pool, test_id, attempt.question_order);
-      return res.json({ attempt, questions, resumed: true });
+      return res.json({
+        attempt,
+        questions,
+        optionOrder: attempt.option_order || {},
+        resumed: true,
+      });
     }
  
     // ── Fresh start path ───────────────────────────────────────────────
@@ -53,25 +84,33 @@ router.post('/start', requireAuth, requireRole('candidate', 'employee'), async (
     }
     const test = testResult.rows[0];
  
-    // Fetch all question IDs for this test, in their original admin-set order
     const idsResult = await pool.query(
       `SELECT id FROM questions WHERE test_id = $1 ORDER BY order_index ASC`,
       [test_id]
     );
     let questionOrder = idsResult.rows.map(r => r.id);
  
-    // Shuffle ONCE here, at creation time, if the test has shuffle enabled.
-    // This array gets saved permanently on the attempt row — every future
-    // read (including resume) uses this exact saved order, never reshuffles.
+    // Shuffle question order, same as before
     if (test.shuffle_questions) {
       questionOrder = fisherYatesShuffle(questionOrder);
     }
  
+    // NEW — build a per-question option shuffle map.
+    // Each question gets its OWN independent shuffle of ['a','b','c','d'].
+    // This is intentionally generated regardless of shuffle_questions —
+    // option shuffling and question shuffling are independent settings.
+    // If you want option shuffling to be optional too, gate this behind
+    // its own flag later (e.g. test.shuffle_options).
+    const optionOrder = {};
+    for (const qId of questionOrder) {
+      optionOrder[qId] = fisherYatesShuffle(['a', 'b', 'c', 'd']);
+    }
+ 
     const newAttempt = await pool.query(
-      `INSERT INTO attempts (test_id, user_id, started_at, submit_status, question_order)
-       VALUES ($1, $2, NOW(), 'in_progress', $3)
+      `INSERT INTO attempts (test_id, user_id, started_at, submit_status, question_order, option_order)
+       VALUES ($1, $2, NOW(), 'in_progress', $3, $4)
        RETURNING *`,
-      [test_id, userId, JSON.stringify(questionOrder)]
+      [test_id, userId, JSON.stringify(questionOrder), JSON.stringify(optionOrder)]
     );
  
     await pool.query(
@@ -85,6 +124,7 @@ router.post('/start', requireAuth, requireRole('candidate', 'employee'), async (
       attempt: newAttempt.rows[0],
       test: { title: test.title, duration_minutes: test.duration_minutes },
       questions,
+      optionOrder,
       resumed: false,
     });
  

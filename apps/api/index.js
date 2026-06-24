@@ -2,18 +2,27 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import pg from 'pg';
-import adminRoutes from './routes/admin.js';
-import testRoutes from './routes/tests.js';
-import attemptRoutes from './routes/attempts.js';
 dotenv.config();
 
 import authRoutes from './routes/auth.js';
+import adminRoutes from './routes/admin.js';
+import testRoutes from './routes/tests.js';
+import attemptRoutes from './routes/attempts.js';
 
 const app = express();
 
-// ── DB pool — created once, reused everywhere ────────────────────
-const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
-app.locals.pool = pool; // makes pool accessible inside route files via req.app.locals
+// ── DB pool — sized deliberately for ~500 concurrent candidates ──────
+// max: 20 means at most 20 simultaneous DB connections are ever open.
+// Requests beyond that queue briefly (milliseconds) rather than
+// overwhelming Postgres. This is the single most important lever
+// for handling load on modest hardware.
+const pool = new pg.Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000,
+});
+app.locals.pool = pool;
 
 // ── Global middleware ──────────────────────────────────────────────
 app.use(cors({ origin: process.env.CLIENT_URL, credentials: true }));

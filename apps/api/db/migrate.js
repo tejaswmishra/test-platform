@@ -109,3 +109,4 @@ runMigration();
 // ALTER TABLE attempts ADD COLUMN IF NOT EXISTS question_order JSONB;
 // ALTER TABLE responses ALTER COLUMN selected_option DROP NOT NULL;
 // ALTER TABLE responses ADD COLUMN IF NOT EXISTS marked_for_review BOOLEAN DEFAULT false;
+// ALTER TABLE attempts ADD COLUMN IF NOT EXISTS option_order JSONB;
