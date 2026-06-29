@@ -68,10 +68,13 @@ router.post('/start', requireAuth, requireRole('candidate', 'employee'), async (
  
     if (existingAttempt.rows.length > 0) {
       const attempt = existingAttempt.rows[0];
+      const testResult = await pool.query(`SELECT * FROM tests WHERE id = $1`, [test_id]);
+      const test = testResult.rows[0];
       const questions = await getQuestionsInOrder(pool, test_id, attempt.question_order);
       return res.json({
         attempt,
         questions,
+        test: { title: test.title, duration_minutes: test.duration_minutes },
         optionOrder: attempt.option_order || {},
         resumed: true,
       });
@@ -364,16 +367,81 @@ router.post(
   }
 );
 
-// async function getQuestionsForCandidate(pool, testId) {
-//   const result = await pool.query(
-//     `SELECT id, question_text, option_a, option_b, option_c, option_d, marks, order_index
-//      FROM questions
-//      WHERE test_id = $1
-//      ORDER BY order_index ASC`,
-//     [testId]
-//   );
-//   return result.rows;
-// }
+// GET /attempts/:attemptId/results
+// Returns the full breakdown (question, candidate's answer, correct answer)
+// ONLY if this attempt belongs to an internal test with show_responses_to_employee = true.
+// This is the actual enforcement point — even if someone crafts a request
+// directly to this URL, the server checks the rule again here.
+router.get(
+  '/:attemptId/results',
+  requireAuth,
+  requireRole('candidate', 'employee'),
+  async (req, res) => {
+    const { pool } = req.app.locals;
+    const { attemptId } = req.params;
+    const userId = req.user.userId;
+ 
+    try {
+      const attemptResult = await pool.query(
+        `SELECT a.*, t.title, t.test_type, t.show_responses_to_employee
+         FROM attempts a
+         JOIN tests t ON t.id = a.test_id
+         WHERE a.id = $1`,
+        [attemptId]
+      );
+ 
+      if (attemptResult.rows.length === 0) {
+        return res.status(404).json({ error: 'Attempt not found' });
+      }
+ 
+      const attempt = attemptResult.rows[0];
+ 
+      // Ownership check — same pattern as validateAttempt
+      if (attempt.user_id !== userId) {
+        return res.status(403).json({ error: 'This is not your attempt' });
+      }
+ 
+      // Must be submitted before results can be viewed
+      if (attempt.submit_status !== 'submitted') {
+        return res.status(403).json({ error: 'This attempt is not yet submitted' });
+      }
+ 
+      // THE ACTUAL RULE — enforced here, not just hidden in the UI
+      if (attempt.test_type !== 'internal' || !attempt.show_responses_to_employee) {
+        return res.status(403).json({ error: 'Results are not available for this test' });
+      }
+ 
+      const responsesResult = await pool.query(
+        `SELECT q.question_text, q.option_a, q.option_b, q.option_c, q.option_d,
+                q.correct_option, q.marks, r.selected_option
+         FROM questions q
+         LEFT JOIN responses r ON r.question_id = q.id AND r.attempt_id = $1
+         WHERE q.test_id = $2
+         ORDER BY q.order_index ASC`,
+        [attemptId, attempt.test_id]
+      );
+ 
+      res.json({
+        test_title: attempt.title,
+        score: attempt.score,
+        total_marks: responsesResult.rows.reduce((sum, q) => sum + q.marks, 0),
+        breakdown: responsesResult.rows.map(q => ({
+          question_text: q.question_text,
+          options: { a: q.option_a, b: q.option_b, c: q.option_c, d: q.option_d },
+          your_answer: q.selected_option,
+          correct_answer: q.correct_option,
+          is_correct: q.selected_option === q.correct_option,
+          marks: q.marks,
+        })),
+      });
+ 
+    } catch (err) {
+      console.error('Get results error:', err.message);
+      res.status(500).json({ error: 'Failed to fetch results' });
+    }
+  }
+);
+ 
 
 
 // Standard Fisher-Yates shuffle — unbiased, O(n), the correct way to

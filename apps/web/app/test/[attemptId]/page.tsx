@@ -76,7 +76,7 @@ export default function TestPage() {
 
         setQuestions(data.questions);
         setOptionOrder(data.optionOrder || {});
-        setDurationMinutes(data.test?.duration_minutes || data.attempt.duration_minutes);
+        setDurationMinutes(data.test?.duration_minutes || 0);
         setStartedAt(data.attempt.started_at);
 
         // Load any previously saved answers (covers resume / refresh)

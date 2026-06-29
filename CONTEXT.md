@@ -123,25 +123,27 @@ test-platform/
 - [x] `app/api/auth/logout/route.ts` — deletes cookie
 - [x] `app/api/proxy/[...path]/route.ts` — forwards all other API calls, attaches Bearer token from cookie
 - [x] `hooks/useAntiCheat.js` — visibilitychange/blur/focus/beforeunload listeners
-- [x] **Test-taking page (`/test/[attemptId]`) — FULLY BUILT AND VERIFIED:**
-  - Question panel with 4 options (A-D), correctly shows shuffled option order per candidate
-  - Pagination grid in sidebar, color-coded by status (gray/green/purple/amber), clickable to jump questions
-  - Previous / Next / Clear Response / Mark for Review / Submit Test buttons all wired
-  - Auto-save on navigation + 20s interval + retry-on-failure logic
-  - Anti-cheat CONFIRMED WORKING LIVE: tab-switch and even a screenshot action triggered auto-submit correctly
-  - State persistence CONFIRMED: stopped mid-test, resumed, all previous answers + statuses correctly restored from `/attempts/:id/status`
-  - Timer renders in header (see KNOWN BUG below)
+- [x] **Results page (`/results/[attemptId]`) — FULLY BUILT AND VERIFIED:**
+  - Shows score + percentage + full question-by-question breakdown (your answer vs correct answer, color coded)
+  - Access gated by `test_type === 'internal' && show_responses_to_employee === true`
+  - Dashboard conditionally renders "View Results" button vs plain "Submitted" label per `can_view_results` flag
+  - Direct URL access to a disallowed attempt's results CONFIRMED blocked server-side (403), not just hidden in UI
 
-## Known Bug — Timer shows 00:00 (not yet fixed, deprioritized for now)
+## Architectural Decision — Internal vs External Tests (added after initial build)
 
-**Symptom:** Test page timer displays `00:00` instead of counting down from the test's actual `duration_minutes`.
+**Requirement:** Two test types exist. `external` (recruitment/new joinees) — candidates NEVER see score or responses, hardcoded, not configurable. `internal` (employee training) — admin can optionally enable `show_responses_to_employee`, and if enabled, employees see a FULL breakdown (their answer + correct answer per question) after submitting.
 
-**Not yet root-caused.** Possible causes to check first when picking this up:
-1. `durationMinutes` state in `page.tsx` may not be getting set correctly from the `/start` response — check the line `setDurationMinutes(data.test?.duration_minutes || data.attempt.duration_minutes)`. Note `attempt` rows don't actually have a `duration_minutes` column (that lives on `tests`), so if `data.test` is ever undefined on a RESUME response specifically, this falls back to `undefined`, not a real number — this is the most likely root cause. Check the resume branch of `/attempts/start` on the backend — it currently returns `{ attempt, questions, optionOrder, resumed: true }` with NO `test` object included at all, only the fresh-start branch includes `test: { title, duration_minutes }`. This is almost certainly the bug — resume path needs to also return test duration.
-2. Confirm `started_at` is a valid timestamp string the frontend's `new Date(startedAt)` can parse correctly (we hit a timezone bug here before — see "Known Gotchas" below, this exact class of bug).
-3. Verify the test used for manual testing actually has a sane `duration_minutes` value (not 0 or null) in the database.
+**Schema:** `tests.test_type` (`'internal'|'external'`, default `'external'`), `tests.show_responses_to_employee` (boolean, default `false`).
 
-**Fix path (likely):** Add `test: { title: test.title, duration_minutes: test.duration_minutes }` to the resume branch response in `POST /attempts/start`, mirroring what the fresh-start branch already returns. Needs a small additional query to fetch the test row in the resume branch (currently only fetched in fresh-start branch).
+**Three-layer enforcement, deliberately redundant — this is the pattern to follow for any future business/fairness rule, not just this feature:**
+1. **DB constraint** — `CHECK (NOT (test_type = 'external' AND show_responses_to_employee = true))`. Physically impossible to store the invalid combination.
+2. **Creation-time validation** — `POST /admin/tests` rejects the invalid combination with a clean 400 before it ever reaches the DB constraint.
+3. **Access-time validation** — `GET /attempts/:id/results` re-checks `test_type` and `show_responses_to_employee` fresh from the DB on every request, regardless of what the frontend shows or hides. Never trust "the button wasn't rendered" as the only protection.
+
+**New routes added for this feature:**
+- `POST /admin/employees`, `GET /admin/employees` — mirrors the candidate routes but for `role = 'employee'`, using `company_id` instead of `email`. (This was a previously-missing gap — employees were assumed pre-existing but we never built a way to actually create one for testing/demo.)
+- `GET /attempts/:attemptId/results` — the gated breakdown route described above.
+- `GET /tests/assigned` updated to include `test_type`, `show_responses_to_employee`, and a computed `can_view_results` boolean per completed test, so the dashboard knows what to render without re-deriving the rule itself (though the rule is STILL re-checked server-side on the actual results route, this is just for UI convenience).
 
 ## What's NOT Started
 
@@ -192,9 +194,11 @@ JWT_SECRET=<MUST match api's JWT_SECRET exactly>
 ## Known Gotchas / Bugs Already Fixed
 
 1. **Timezone bug (fixed):** Postgres `TIMESTAMP` (no timezone) columns caused JS `Date` parsing to misread elapsed time by several hours in some code paths. Fixed by migrating all timestamp columns to `TIMESTAMPTZ`. Lesson: always use `TIMESTAMPTZ` for anything timer-related.
-2. **`.env` location matters:** must live in `apps/api/.env`, NOT the monorepo root — `dotenv.config()` resolves relative to where `node` is actually run from.
-3. **PATCH vs POST, singular vs plural route confusion:** `/attempts/:id/answer` (singular, PATCH) saves one answer. `/attempts/:id/answers` (plural, GET) lists all saved answers. Easy to typo.
-4. **bcrypt hashes are one-way** — if a temp password is lost, there is no recovery; must issue a new one.
+2. **Timer showing 00:00 on resume (fixed):** the RESUME branch of `POST /attempts/start` didn't return the `test` object at all (only `attempt`, `questions`, `optionOrder`), so frontend's `durationMinutes` state had nothing to read on resume. Fixed by also returning `test: { title, duration_minutes }` in the resume branch, mirroring the fresh-start branch.
+3. **`.env` location matters:** must live in `apps/api/.env`, NOT the monorepo root — `dotenv.config()` resolves relative to where `node` is actually run from.
+4. **PATCH vs POST, singular vs plural route confusion:** `/attempts/:id/answer` (singular, PATCH) saves one answer. `/attempts/:id/answers` (plural, GET) lists all saved answers. Easy to typo.
+5. **bcrypt hashes are one-way** — if a temp password is lost, there is no recovery; must issue a new one.
+6. **Missing employee-creation route (fixed):** `POST /admin/candidates` only ever created `role='candidate'` rows. There was no way to create an employee for testing until `POST /admin/employees` was added.
 
 ## Coding Conventions Used So Far
 

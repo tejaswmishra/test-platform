@@ -4,6 +4,11 @@ import { requireAuth, requireRole } from '../middleware/auth.js';
 const router = express.Router();
 
 // GET /tests/assigned
+// Replace your GET /tests/assigned route in apps/api/routes/tests.js
+// Now also returns test_type + show_responses_to_employee, so the
+// frontend dashboard knows whether to render a "View Results" button
+// at all for each completed test.
+
 router.get('/assigned', requireAuth, requireRole('candidate', 'employee'), async (req, res) => {
   const { pool } = req.app.locals;
   const userId = req.user.userId;
@@ -18,6 +23,8 @@ router.get('/assigned', requireAuth, requireRole('candidate', 'employee'), async
          t.title,
          t.description,
          t.duration_minutes,
+         t.test_type,
+         t.show_responses_to_employee,
          a.id as attempt_id,
          a.score,
          a.submitted_at,
@@ -32,7 +39,16 @@ router.get('/assigned', requireAuth, requireRole('candidate', 'employee'), async
 
     const pending = result.rows.filter(r => r.attempt_status === 'pending');
     const inProgress = result.rows.filter(r => r.attempt_status === 'in_progress');
-    const completed = result.rows.filter(r => r.attempt_status === 'submitted');
+
+    // For completed tests, decide per-row whether results can be viewed.
+    // This is the SAME rule enforced again on the detail route itself —
+    // never trust the frontend to respect this on its own.
+    const completed = result.rows
+      .filter(r => r.attempt_status === 'submitted')
+      .map(r => ({
+        ...r,
+        can_view_results: r.test_type === 'internal' && r.show_responses_to_employee,
+      }));
 
     res.json({ pending, inProgress, completed });
 

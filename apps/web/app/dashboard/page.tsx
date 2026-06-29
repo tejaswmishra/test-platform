@@ -12,6 +12,7 @@ interface AssignedTest {
   attempt_status: string;
   score?: number;
   attempt_id?: string;
+  can_view_results?: boolean;
 }
 
 export default function DashboardPage() {
@@ -119,7 +120,7 @@ export default function DashboardPage() {
         {completed.length > 0 && (
           <Section title="Completed">
             {completed.map((t) => (
-              <TestCard key={t.assignment_id} test={t} completed accentColor="#059669" />
+              <TestCard key={t.assignment_id} test={t} completed accentColor="#059669" router={router} />
             ))}
           </Section>
         )}
@@ -144,6 +145,7 @@ function TestCard({
   loading,
   completed,
   accentColor,
+  router,
 }: {
   test: AssignedTest;
   actionLabel?: string;
@@ -151,6 +153,7 @@ function TestCard({
   loading?: boolean;
   completed?: boolean;
   accentColor: string;
+  router?: ReturnType<typeof useRouter>;
 }) {
   return (
     <div style={{ ...styles.card, borderTopColor: accentColor }}>
@@ -159,10 +162,19 @@ function TestCard({
       <p style={styles.cardMeta}>{test.duration_minutes} minutes</p>
 
       {completed ? (
-        <div style={styles.scoreBox}>
-          <span style={styles.scoreLabel}>Score</span>
-          <span style={styles.scoreValue}>{test.score ?? '—'}</span>
-        </div>
+        test.can_view_results ? (
+          <button
+            onClick={() => router?.push(`/results/${test.attempt_id}`)}
+            style={{ ...styles.actionBtn, backgroundColor: accentColor }}
+          >
+            View Results
+          </button>
+        ) : (
+          <div style={styles.scoreBox}>
+            <span style={styles.scoreLabel}>Status</span>
+            <span style={styles.submittedLabel}>Submitted</span>
+          </div>
+        )
       ) : (
         <button
           onClick={onAction}
@@ -285,6 +297,11 @@ const styles: Record<string, React.CSSProperties> = {
   scoreLabel: {
     fontSize: 12,
     color: '#6B7280',
+  },
+  submittedLabel: {
+    fontSize: 13,
+    fontWeight: 600,
+    color: '#374151',
   },
   scoreValue: {
     fontSize: 20,
