@@ -147,29 +147,71 @@ test-platform/
 
 ## What's NOT Started
 
-- [ ] Admin dashboard/UI entirely — currently NO admin-facing pages exist (`/admin/dashboard`, create-test form, candidate list with "registered today" filter, responses table, terminate/reset buttons)
-- [ ] Admin: bulk Excel upload (backend route designed earlier in conversation, not yet built)
-- [ ] Excel export of results (backend route designed earlier, not yet built)
-- [ ] Loading states, empty states, error boundaries — present in dashboard/test page, NOT yet audited across admin pages (since admin pages don't exist yet)
-- [ ] Office-PC-specific: local Postgres needs schema kept in sync with Neon (`option_order` column was added to Neon — confirm it's also run on local Postgres at office, since today's office session predates that schema addition)
+- [ ] Admin: bulk Excel question upload (template download + parse-upload route — designed in detail early in the conversation, never built; not blocking, manual question entry via the Tests tab form works fine as a substitute)
+- [ ] Loading states, empty states, error boundaries — present in dashboard/test page/admin tabs at a basic level, NOT rigorously audited for every edge case (e.g. network failure mid-admin-action)
+- [ ] `keyGenerator` fix for `answerLimiter` (currently keys by IP, should key by `req.user.userId` for correctness when many candidates share an office network/IP) — discussed, not yet implemented, low urgency unless actual 500-candidate load testing surfaces it as a real issue
+- [ ] Office-PC-specific: local Postgres needs `test_type`, `show_responses_to_employee`, and the `external_never_shows_responses` constraint added (see TODOS below) — these schema changes happened after the last office sync
+- [ ] No automated tests exist anywhere (unit/integration) — everything has been manually verified via Thunder Client + browser testing. Worth flagging as a known gap if asked, not necessarily worth building out given the timeline.
+- [ ] No deployment/hosting decision made yet for the actual production environment — current setup is local dev (Neon + localhost Express/Next.js). Worth raising with manager/senior now that features are largely complete.
 
-## TODOS for today (office, no AI/push access)
+- [x] **Admin UI — FULLY BUILT AND VERIFIED (`/admin/dashboard`, tabbed single-page):**
+  - **Tests tab**: create test form (title/description/duration/shuffle/internal-external toggle/show-responses checkbox), inline question builder (click-to-mark-correct UX, live incomplete-question warning), test list table, Assign modal (candidate+employee selection, "registered today" filter, specific-or-all modes)
+  - **Candidates tab**: register form, credentials-shown-once modal, table, "today only" filter
+  - **Employees tab**: same pattern as candidates, using `company_id` instead of email
+  - **Responses tab**: per-test assignment status table, Terminate action (voids in-progress attempt), Allow Restart action (voids attempt + resets assignment to pending), Export to Excel button
+  - All four tabs share `sharedStyles.ts` for visual consistency with the candidate-facing pages
 
-1. **First priority — confirm local Postgres has `option_order` column.** Run in pgAdmin Query Tool:
+- [x] **Excel export — FULLY BUILT, ITERATED ON USER FEEDBACK, VERIFIED:**
+  - Single flat sheet (not multi-sheet — simplified per explicit user request)
+  - One row per candidate attempt: Name, Email/Company ID, Phone, Score, Submitted At
+  - One column PER QUESTION (dynamically generated), header shows full question text (e.g. "Q1: What does...") with wrapped text + tall header row, NOT just "Q1"
+  - Each question column shows the candidate's actual selected answer as readable text (e.g. "C) 32"), NOT the correct answer, NOT marks awarded — deliberately simple per user request, no scoring detail mixed into the per-question columns (score is its own separate summary column)
+
+## New backend routes added during admin UI build
+
+- `POST /admin/employees`, `GET /admin/employees` (covered earlier)
+- `POST /admin/tests/:id/terminate` — body `{ user_id }`, voids an in-progress attempt, marks submitted with `submit_reason: 'admin_terminated'`, logs to `attempt_events`
+- `POST /admin/tests/:id/restart` — body `{ user_id }`, voids ALL existing attempts for that test+user (handles multiple historical attempts), resets `test_assignments.attempt_status` back to `'pending'`. Relies on existing `/attempts/start` resume logic naturally creating a fresh attempt since voided attempts no longer match the `in_progress` resume check — no extra logic needed there.
+- `GET /admin/tests/:id/export` — the flat single-sheet Excel export described above. Uses `exceljs`, builds columns dynamically based on question count, response lookup keyed by `${attempt_id}_${question_id}` for O(1) lookups while building rows.
+
+## Known Gotchas / Bugs Already Fixed (continued)
+
+7. **TypeScript syntax leaking into plain `.js` backend files (fixed):** Accidentally included `: Record<string, any>`, `: any`, `: number` type annotations in `apps/api/routes/admin.js` (a plain Node.js file, not TypeScript). Node's ESM loader crashes immediately on this with `SyntaxError: Missing initializer in const declaration`. Lesson: backend files are plain `.js`, never paste TypeScript-flavored code there even as a copy-paste artifact from a `.tsx` context.
+8. **`middleware.ts` → `proxy.ts` rename (Next.js 16):** Next.js renamed the middleware file convention; `middleware.ts` still works but is deprecated. Renamed file to `proxy.ts` and the exported function from `middleware` to `proxy` — everything else (matcher config, JWT verification logic) unchanged.
+9. **Proxy route crashed on binary file responses (fixed):** `app/api/proxy/[...path]/route.ts` unconditionally called `expressRes.json()` on every response, which crashed on the Excel export route's binary `.xlsx` bytes (`SyntaxError: Unexpected token 'P', "PK..."` — PK is the ZIP file signature Excel files start with). Fixed by checking `Content-Type` header: if not `application/json`, stream raw bytes through via `arrayBuffer()` instead, preserving `Content-Disposition` so the browser still triggers a proper file download.
+10. **Multi-tab/multi-role testing logs you out unexpectedly — NOT a bug, expected cookie behavior.** Logging in as admin in one tab overwrites the SAME `token` cookie a candidate tab was relying on (cookies are domain-scoped, not tab-scoped). Refreshing the candidate tab afterward sends the admin's token, which `requireRole` correctly rejects, bouncing back to login. Fix for testing: use two different browsers, or one normal + one Incognito window, never two tabs of the same browser for two different roles simultaneously. This is not an issue in real usage since admin and candidates are different people on different physical machines.
+
+## Current Overall Status — nearly feature-complete
+
+**Fully working end-to-end:** auth (3 roles), candidate/employee dashboard, full test-taking UI (shuffle, option-shuffle, review flags, pagination, anti-cheat, auto-save+retry, server-side timer), gated results viewing (internal/external test types), and the FULL admin UI (candidates, employees, tests w/ question builder, assignment, responses w/ terminate+restart, Excel export).
+
+**What remains (see "What's NOT Started" above, and TODOS below) is smaller, more "polish and hardening" than "new features."**
+
+## TODOS for next office session (no AI/push access)
+
+Given the project is now feature-complete on both candidate and admin sides, office time should focus on HARDENING and TESTING, not new features.
+
+1. **Sync local Postgres schema with Neon.** Several changes happened since office Postgres was last touched: `test_type`, `show_responses_to_employee` on `tests`, plus the `external_never_shows_responses` constraint. Run in pgAdmin Query Tool:
    ```sql
-   ALTER TABLE attempts ADD COLUMN IF NOT EXISTS option_order JSONB;
+   ALTER TABLE tests ADD COLUMN IF NOT EXISTS test_type VARCHAR(20) NOT NULL DEFAULT 'external'
+     CHECK (test_type IN ('internal', 'external'));
+   ALTER TABLE tests ADD COLUMN IF NOT EXISTS show_responses_to_employee BOOLEAN NOT NULL DEFAULT false;
+   ALTER TABLE tests ADD CONSTRAINT external_never_shows_responses
+     CHECK (NOT (test_type = 'external' AND show_responses_to_employee = true));
    ```
-   This was added AFTER your last office session, so local Postgres is likely missing it. Without this, `/attempts/start` will throw a DB error on this machine specifically.
 
-2. **Re-verify the full candidate flow end-to-end on local Postgres**, same as you just did at home: login → dashboard → start test → answer/mark-for-review/navigate via grid → tab-switch triggers auto-submit → resume restores state correctly. This confirms the frontend work from tonight also works against the office's local DB, not just Neon.
+2. **Full regression pass on local Postgres** — login → create test → register candidate/employee → assign → take test as that user → check Responses tab updates → export Excel — confirm everything still works against office's local DB.
 
-3. **Investigate the timer bug** (see above) — even without AI, you can read through `POST /attempts/start` in `attempts.js` and compare the fresh-start vs resume branches side by side. The fix is likely a one-line addition once you spot it. If you find and fix it, that's a clean win to bring home tonight.
+3. **Heavy manual QA / edge-case hunting** — genuinely valuable office time:
+   - Multiple candidates/employees taking the SAME test simultaneously (several incognito windows) — watch for data crossing between attempts
+   - Terminate an attempt WHILE that candidate still has the test open elsewhere — does their next save/submit correctly get rejected?
+   - Restart a test, confirm the candidate gets a genuinely NEW shuffle order, not the old one
+   - Try assigning a test to zero people — confirm it's blocked cleanly
+   - Export Excel for a test with ZERO submitted attempts — confirm no crash
 
-4. **Do NOT attempt to build admin UI today** — that's a larger, multi-file task better tackled with AI assistance at home tonight, not worth starting and abandoning half-built on a machine you can't push from.
+4. **Decide with manager: what's the actual MVP cutoff for demo day?** Use the "What's NOT Started" list above to explicitly separate must-haves from nice-to-haves.
 
-5. **Useful offline task: sketch the admin dashboard layout on paper** — what sections exist (candidate list, create test, assign, view responses), roughly how they're organized. This sets up tonight's AI-assisted build session with a clear plan already decided.
-
-6. **Document any NEW bugs found today** in this same style as the timer bug above — symptom, suspected cause, suggested fix path — so tonight's session starts with a clear list rather than vague memory of "something was off."
+5. **Do NOT start bulk Excel question upload today** — new feature requiring multer + parsing, better suited for an AI-assisted home session.
 
 ## Environment Variables
 

@@ -5,7 +5,7 @@ import { jwtVerify } from 'jose';
 // redirects to the appropriate login page if missing or invalid.
 // We use 'jose' here (not jsonwebtoken) because Next.js middleware runs
 // on the Edge runtime, which jsonwebtoken's Node-specific APIs don't support.
-export async function middleware(req: NextRequest) {
+export async function proxy(req: NextRequest) {
   const token = req.cookies.get('token')?.value;
   const { pathname } = req.nextUrl;
 

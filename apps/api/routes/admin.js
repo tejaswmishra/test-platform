@@ -1,5 +1,6 @@
 import express from 'express';
 import bcrypt from 'bcryptjs';
+import ExcelJS from 'exceljs';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 
 const router = express.Router();
@@ -378,13 +379,14 @@ router.post('/tests/:id/restart', requireAuth, requireRole('admin'), async (req,
   }
 });
 
+// Replace your existing GET /admin/tests/:id/export route in
+// apps/api/routes/admin.js with this simplified version.
+// Single sheet, one row per candidate, one column per question.
 
-// Add this to apps/api/routes/admin.js
-// First install: npm install exceljs (you likely already have this from earlier)
+// Replace your existing GET /admin/tests/:id/export route in
+// apps/api/routes/admin.js with this simplified version.
+// Single sheet, one row per candidate, one column per question.
 
-import ExcelJS from 'exceljs';
-
-// GET /admin/tests/:id/export
 router.get('/tests/:id/export', requireAuth, requireRole('admin'), async (req, res) => {
   const { pool } = req.app.locals;
   const { id: testId } = req.params;
@@ -395,80 +397,88 @@ router.get('/tests/:id/export', requireAuth, requireRole('admin'), async (req, r
       return res.status(404).json({ error: 'Test not found' });
     }
 
-    const rows = await pool.query(`
-      SELECT 
-        u.name, u.email, u.phone, u.company_id, u.role,
-        a.id as attempt_id, a.score, a.submitted_at, 
-        a.submit_reason, a.started_at, a.is_voided,
-        r.question_id, r.selected_option,
-        q.question_text, q.correct_option, q.marks
-      FROM attempts a
-      JOIN users u ON u.id = a.user_id
-      LEFT JOIN responses r ON r.attempt_id = a.id
-      LEFT JOIN questions q ON q.id = r.question_id
-      WHERE a.test_id = $1
-      ORDER BY a.submitted_at DESC NULLS LAST, u.name
-    `, [testId]);
+    // Get all questions for this test, in their original order —
+    // this defines the column order (Q1, Q2, Q3...)
+    const questionsResult = await pool.query(
+      `SELECT id, question_text, option_a, option_b, option_c, option_d, order_index
+       FROM questions WHERE test_id = $1 ORDER BY order_index ASC`,
+      [testId]
+    );
+    const questions = questionsResult.rows;
+
+    // Get every attempt for this test, with their candidate info
+    const attemptsResult = await pool.query(
+      `SELECT a.id as attempt_id, a.score, a.submitted_at, a.submit_reason,
+              u.name, u.email, u.phone, u.company_id, u.role
+       FROM attempts a
+       JOIN users u ON u.id = a.user_id
+       WHERE a.test_id = $1
+       ORDER BY a.submitted_at DESC NULLS LAST, u.name`,
+      [testId]
+    );
+
+    // Get ALL responses for this test in one query, keyed by attempt+question
+    // so we can look up "what did attempt X answer for question Y" quickly
+    const responsesResult = await pool.query(
+      `SELECT r.attempt_id, r.question_id, r.selected_option
+       FROM responses r
+       JOIN attempts a ON a.id = r.attempt_id
+       WHERE a.test_id = $1`,
+      [testId]
+    );
+
+    const responseLookup = {};
+    for (const r of responsesResult.rows) {
+      responseLookup[`${r.attempt_id}_${r.question_id}`] = r.selected_option;
+    }
 
     const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet('Results');
 
-    // ── Sheet 1: Summary ──────────────────────────────
-    const summary = workbook.addWorksheet('Summary');
-    summary.columns = [
+    // Build columns dynamically: fixed candidate info columns,
+    // then one column per question (Q1, Q2, Q3...)
+    const fixedColumns = [
       { header: 'Name', key: 'name', width: 22 },
       { header: 'Email / Company ID', key: 'identifier', width: 26 },
-      { header: 'Role', key: 'role', width: 12 },
+      { header: 'Phone', key: 'phone', width: 16 },
       { header: 'Score', key: 'score', width: 10 },
-      { header: 'Percentage', key: 'pct', width: 12 },
-      { header: 'Submit Reason', key: 'submit_reason', width: 18 },
-      { header: 'Voided', key: 'is_voided', width: 10 },
       { header: 'Submitted At', key: 'submitted_at', width: 22 },
     ];
-    summary.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
-    summary.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A56DB' } };
 
-    const attemptMap: Record<string, any> = {};
-    for (const row of rows.rows) {
-      if (!attemptMap[row.attempt_id]) {
-        const totalMarks = rows.rows
-          .filter((r: any) => r.attempt_id === row.attempt_id && r.marks)
-          .reduce((sum: number, r: any) => sum + r.marks, 0);
+    const questionColumns = questions.map((q, idx) => ({
+      header: `Q${idx + 1}: ${q.question_text}`,
+      key: `q_${q.id}`,
+      width: 35,
+    }));
 
-        attemptMap[row.attempt_id] = {
-          name: row.name,
-          identifier: row.email || row.company_id || '—',
-          role: row.role,
-          score: row.score ?? '—',
-          pct: totalMarks > 0 && row.score != null ? `${((row.score / totalMarks) * 100).toFixed(1)}%` : '—',
-          submit_reason: row.submit_reason || '—',
-          is_voided: row.is_voided ? 'Yes' : 'No',
-          submitted_at: row.submitted_at ? new Date(row.submitted_at).toLocaleString() : 'Not submitted',
-        };
+    sheet.columns = [...fixedColumns, ...questionColumns];
+
+    sheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
+    sheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A56DB' } };
+    sheet.getRow(1).alignment = { wrapText: true, vertical: 'top' };
+    sheet.getRow(1).height = 60;
+
+    // One row per candidate attempt
+    for (const attempt of attemptsResult.rows) {
+      const rowData = {
+        name: attempt.name,
+        identifier: attempt.email || attempt.company_id || '—',
+        phone: attempt.phone || '—',
+        score: attempt.score ?? '—',
+        submitted_at: attempt.submitted_at
+          ? new Date(attempt.submitted_at).toLocaleString()
+          : 'Not submitted',
+      };
+
+      // Fill in each question column with the candidate's selected option text
+      for (const q of questions) {
+        const selected = responseLookup[`${attempt.attempt_id}_${q.id}`];
+        rowData[`q_${q.id}`] = selected
+          ? `${selected.toUpperCase()}) ${q[`option_${selected}`]}`
+          : 'Not answered';
       }
-    }
-    Object.values(attemptMap).forEach((r) => summary.addRow(r));
 
-    // ── Sheet 2: Detailed Responses ───────────────────
-    const detail = workbook.addWorksheet('Detailed Responses');
-    detail.columns = [
-      { header: 'Candidate', key: 'name', width: 22 },
-      { header: 'Question', key: 'question_text', width: 45 },
-      { header: 'Selected', key: 'selected', width: 12 },
-      { header: 'Correct', key: 'correct', width: 12 },
-      { header: 'Result', key: 'result', width: 10 },
-    ];
-    detail.getRow(1).font = { bold: true };
-
-    for (const row of rows.rows) {
-      if (!row.question_id) continue; // skip rows with no responses at all
-      const isCorrect = row.selected_option === row.correct_option;
-      detail.addRow({
-        name: row.name,
-        question_text: row.question_text,
-        selected: row.selected_option ? row.selected_option.toUpperCase() : 'Not answered',
-        correct: row.correct_option?.toUpperCase(),
-        result: isCorrect ? 'Correct' : 'Incorrect',
-      });
+      sheet.addRow(rowData);
     }
 
     const safeTitle = testResult.rows[0].title.replace(/[^a-z0-9]/gi, '-').toLowerCase();
@@ -483,5 +493,64 @@ router.get('/tests/:id/export', requireAuth, requireRole('admin'), async (req, r
   }
 });
 
+
+// Add this to apps/api/routes/admin.js, alongside your existing
+// POST /candidates and GET /candidates routes.
+
+// POST /admin/employees
+// Admin creates an employee account, using company_id instead of email
+// as the login identifier — mirrors POST /candidates closely, but for
+// the employee role.
+router.post('/employees', requireAuth, requireRole('admin'), async (req, res) => {
+  const { pool } = req.app.locals;
+  const { name, company_id, email, phone } = req.body;
+
+  if (!name || !company_id) {
+    return res.status(400).json({ error: 'name and company_id are required' });
+  }
+
+  try {
+    const existing = await pool.query(`SELECT id FROM users WHERE company_id = $1`, [company_id]);
+    if (existing.rows.length > 0) {
+      return res.status(409).json({ error: 'An employee with this company_id already exists' });
+    }
+
+    const tempPassword = Math.random().toString(36).slice(-8).toUpperCase();
+    const passwordHash = await bcrypt.hash(tempPassword, 10);
+
+    const result = await pool.query(
+      `INSERT INTO users (name, company_id, email, phone, role, password_hash)
+       VALUES ($1, $2, $3, $4, 'employee', $5)
+       RETURNING id, name, company_id, email, phone, role, created_at`,
+      [name, company_id, email || null, phone || null, passwordHash]
+    );
+
+    res.status(201).json({
+      employee: result.rows[0],
+      tempPassword,
+    });
+
+  } catch (err) {
+    console.error('Create employee error:', err.message);
+    res.status(500).json({ error: 'Failed to create employee' });
+  }
+});
+
+// GET /admin/employees
+router.get('/employees', requireAuth, requireRole('admin'), async (req, res) => {
+  const { pool } = req.app.locals;
+
+  try {
+    const result = await pool.query(
+      `SELECT id, name, company_id, email, phone, created_at 
+       FROM users WHERE role = 'employee' 
+       ORDER BY created_at DESC`
+    );
+    res.json({ employees: result.rows });
+  } catch (err) {
+    console.error('List employees error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch employees' });
+  }
+});
 
 export default router;
