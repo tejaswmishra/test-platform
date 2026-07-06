@@ -7,245 +7,309 @@
 
 - **Frontend:** Next.js (App Router), TypeScript, no external UI library — custom inline styles
 - **Backend:** Express.js (v5), Node.js, ES Modules (`"type": "module"` in package.json)
-- **Database:** PostgreSQL, hosted on Neon (serverless, cloud — accessible from any machine)
-- **Auth:** JWT (`jsonwebtoken` on backend, `jose` for Edge-compatible verification in Next.js middleware)
-- **File generation:** `exceljs` for bulk question upload + results export
-- **File upload:** `multer` (memory storage, for parsing Excel uploads)
+- **Database:** PostgreSQL hosted on Neon (serverless cloud — accessible from any machine)
+- **Auth:** JWT (`jsonwebtoken` on backend, `jose` for Edge-compatible verification in Next.js proxy.ts)
+- **File generation:** `exceljs` for Excel template download + results export
+- **File upload:** `multer` (memory storage, for parsing bulk question Excel uploads)
+- **Process manager (production):** PM2
+
+## Repository
+
+Private GitHub repo: https://github.com/tejaswmishra/test-platform
 
 ## Repository Structure
 
 ```
 test-platform/
 ├── apps/
-│   ├── api/                  ← Express backend
-│   │   ├── index.js          ← entry point, mounts all routers
+│   ├── api/                          ← Express backend
+│   │   ├── index.js                  ← entry point, pool config (max:20), mounts all routers
 │   │   ├── middleware/
-│   │   │   ├── auth.js       ← requireAuth, requireRole
-│   │   │   └── antiCheat.js  ← validateAttempt, calculateScore, autoSubmitOnTimeout
+│   │   │   ├── auth.js               ← requireAuth, requireRole
+│   │   │   └── antiCheat.js          ← validateAttempt, calculateScore, autoSubmitOnTimeout
 │   │   ├── routes/
-│   │   │   ├── auth.js       ← POST /auth/login
-│   │   │   ├── admin.js      ← candidates, tests, assign, assignments (all admin-only)
-│   │   │   ├── tests.js      ← GET /tests/assigned (candidate dashboard data)
-│   │   │   └── attempts.js   ← start, answer, status, submit, events
+│   │   │   ├── auth.js               ← POST /auth/login
+│   │   │   ├── admin.js              ← all admin routes (see below)
+│   │   │   ├── tests.js              ← GET /tests/assigned
+│   │   │   └── attempts.js           ← start, answer, status, submit, events, results
 │   │   └── db/
-│   │       ├── migrate.js    ← creates all tables, run once per fresh DB
-│   │       └── seed.js       ← creates default admin account, idempotent
-│   └── web/                  ← Next.js frontend
-│       ├── middleware.ts     ← route protection, verifies JWT cookie (root level!)
+│   │       ├── migrate.js            ← creates all tables, run once per fresh DB
+│   │       └── seed.js               ← creates default admin account, idempotent
+│   └── web/                          ← Next.js frontend
+│       ├── proxy.ts                  ← route protection, verifies JWT cookie (root level!)
 │       ├── app/
 │       │   ├── api/
-│       │   │   ├── auth/login/route.ts   ← proxies to Express, sets httpOnly cookie
-│       │   │   ├── auth/logout/route.ts  ← deletes cookie
-│       │   │   └── proxy/[...path]/route.ts ← forwards all other API calls, attaches Bearer token from cookie
-│       │   ├── login/page.tsx           ← candidate/employee login (toggle)
-│       │   ├── admin/login/page.tsx     ← separate admin login (different styling, not linked publicly)
-│       │   ├── dashboard/page.tsx       ← candidate/employee dashboard
-│       │   └── test/[attemptId]/        ← NOT YET BUILT — test-taking UI
-│       └── lib/auth.ts       ← getCurrentUser() server helper, apiFetch() client helper
+│       │   │   ├── auth/login/route.ts          ← proxies to Express, sets httpOnly cookie
+│       │   │   ├── auth/logout/route.ts         ← deletes cookie
+│       │   │   ├── proxy/[...path]/route.ts     ← forwards JSON API calls with Bearer token
+│       │   │   └── admin/questions/parse-upload/route.ts  ← dedicated multipart upload route
+│       │   ├── login/page.tsx                   ← candidate/employee login (toggle)
+│       │   ├── admin/
+│       │   │   ├── login/page.tsx               ← separate admin login (dark styling)
+│       │   │   ├── dashboard/page.tsx            ← tabbed admin shell
+│       │   │   └── components/
+│       │   │       ├── sharedStyles.ts
+│       │   │       ├── CandidatesTab.tsx
+│       │   │       ├── EmployeesTab.tsx
+│       │   │       ├── TestsTab.tsx              ← includes CreateTestModal + AssignTestModal
+│       │   │       └── ResponsesTab.tsx
+│       │   ├── dashboard/page.tsx               ← candidate/employee dashboard
+│       │   ├── test/[attemptId]/page.tsx         ← test-taking UI
+│       │   └── results/[attemptId]/page.tsx      ← results breakdown (internal tests only)
+│       ├── hooks/
+│       │   └── useAntiCheat.js
+│       └── lib/
+│           └── auth.ts
 ├── .gitignore
 └── README.md
 ```
 
-## Database Schema (current state)
+## Complete Database Schema
 
 ### users
-- `id` UUID PK, `name`, `email` (nullable), `phone` (nullable), `company_id` (nullable), `role` (`candidate`|`employee`|`admin`), `password_hash` (bcrypt)
-- Candidates/admin login via email. Employees login via company_id.
+`id` UUID PK, `name`, `email` (nullable), `phone` (nullable), `company_id` (nullable), `role` (`candidate`|`employee`|`admin`), `password_hash` (bcrypt), `created_at` TIMESTAMPTZ
 
 ### tests
-- `id` UUID PK, `title`, `description`, `duration_minutes`, `pass_percentage` (default 60), `shuffle_questions` (bool), `is_active` (bool), `created_by` FK→users
+`id` UUID PK, `title`, `description`, `duration_minutes`, `pass_percentage` (default 60), `shuffle_questions` (bool), `is_active` (bool), `test_type` (`internal`|`external`, default `external`), `show_responses_to_employee` (bool, default false), `created_by` FK→users, `created_at` TIMESTAMPTZ
+Constraint: `CHECK (NOT (test_type = 'external' AND show_responses_to_employee = true))`
 
 ### questions
-- `id` UUID PK, `test_id` FK→tests (CASCADE DELETE), `question_text`, `option_a/b/c/d`, `correct_option` (char a-d), `marks`, `order_index`
-- Questions belong to exactly ONE test — no shared question bank (deliberate decision)
+`id` UUID PK, `test_id` FK→tests (CASCADE DELETE), `question_text`, `option_a/b/c/d`, `correct_option` (char a-d), `marks`, `order_index`, `created_at` TIMESTAMPTZ
 
 ### test_assignments
-- `id` UUID PK, `test_id` FK, `user_id` FK, `assigned_at`, `attempt_status` (`pending`|`in_progress`|`submitted`)
-- UNIQUE(test_id, user_id) — prevents duplicate assignment
+`id` UUID PK, `test_id` FK, `user_id` FK, `assigned_at` TIMESTAMPTZ, `attempt_status` (`pending`|`in_progress`|`submitted`)
+Constraint: `UNIQUE(test_id, user_id)`
 
 ### attempts
-- `id` UUID PK, `test_id` FK, `user_id` FK, `started_at` (TIMESTAMPTZ), `submitted_at` (TIMESTAMPTZ), `score`, `submit_status`, `submit_reason` (`manual`|`tab_switch`|`timeout`|etc), `is_voided`, `question_order` (JSONB array of question UUIDs — the per-candidate shuffle order)
-- **IMPORTANT:** all timestamp columns are `TIMESTAMPTZ`, not `TIMESTAMP`. We hit a real bug early on where plain `TIMESTAMP` columns caused JS `Date` parsing to misinterpret timezone, breaking the server-side timer. Never use plain `TIMESTAMP` for anything time-sensitive in this project.
+`id` UUID PK, `test_id` FK, `user_id` FK, `started_at` TIMESTAMPTZ, `submitted_at` TIMESTAMPTZ, `score`, `submit_status`, `submit_reason` (`manual`|`tab_switch`|`timeout`|`admin_terminated`|etc), `is_voided` (bool), `question_order` (JSONB — shuffled question ID array), `option_order` (JSONB — per-question option shuffle map), `created_at` TIMESTAMPTZ
 
 ### responses
-- `id` UUID PK, `attempt_id` FK, `question_id` FK, `selected_option` (char a-d, NULLABLE), `marked_for_review` (bool, default false), `answered_at`
-- UNIQUE(attempt_id, question_id)
-- A row existing with `selected_option = null` but `marked_for_review = true` represents "marked for review, not yet answered" — this is why selected_option had its NOT NULL constraint dropped.
-- A row NOT existing at all = question untouched entirely.
+`id` UUID PK, `attempt_id` FK, `question_id` FK, `selected_option` (char a-d, NULLABLE), `marked_for_review` (bool, default false), `answered_at` TIMESTAMPTZ
+Constraint: `UNIQUE(attempt_id, question_id)`
 
 ### attempt_events
-- `id` UUID PK, `attempt_id` FK, `event_type` (`manual_submitted`|`auto_submitted`|`tab_switch`|etc), `occurred_at`, `metadata` (JSONB)
-- Audit trail — append-only log of everything that happened during an attempt.
+`id` UUID PK, `attempt_id` FK, `event_type`, `occurred_at` TIMESTAMPTZ, `metadata` JSONB
 
-## Key Architectural Decisions (and why)
+## All Backend Routes
 
-1. **JWT payload is identical shape for all 3 roles** (`userId`, `role`, `name`). Role-based access is enforced via `requireRole(...roles)` middleware, not separate auth systems.
+### Auth
+- `POST /auth/login` — body: `{ userType, email|company_id, password }` → returns JWT + user
 
-2. **Server-side timer is the source of truth, never trust frontend.** `validateAttempt` middleware recalculates elapsed time from `started_at` on every request to `/answer` and `/submit`. If expired, it auto-submits and scores right there in the middleware, before the route handler even runs.
+### Admin (all require `requireAuth + requireRole('admin')`)
+- `POST /admin/candidates` — creates candidate with temp password
+- `GET /admin/candidates` — lists all candidates
+- `POST /admin/employees` — creates employee with company_id + temp password
+- `GET /admin/employees` — lists all employees
+- `POST /admin/tests` — creates test + questions in a single DB transaction
+- `GET /admin/tests` — lists all tests with question count
+- `GET /admin/tests/:id` — single test with full questions (includes correct_option — admin only)
+- `POST /admin/tests/:id/assign` — body: `{ mode: 'specific'|'all', user_ids?, roles? }`
+- `GET /admin/tests/:id/assignments` — who's assigned, with attempt_status
+- `POST /admin/tests/:id/terminate` — body: `{ user_id }` — voids in-progress attempt
+- `POST /admin/tests/:id/restart` — body: `{ user_id }` — voids all attempts, resets to pending
+- `GET /admin/tests/:id/export` — streams .xlsx file (flat sheet, one row per candidate, Q1/Q2... columns)
+- `GET /admin/question-template` — streams blank .xlsx template for bulk upload
+- `POST /admin/questions/parse-upload` — multer file upload, parses + validates, returns preview (does NOT save to DB)
 
-3. **Candidates never receive `correct_option` in any API response.** The `getQuestionsInOrder` helper explicitly excludes it. Admin-only routes (`GET /admin/tests/:id`) do include it.
+### Candidate/Employee
+- `GET /tests/assigned` — returns `{ pending, inProgress, completed }` arrays, each item includes `can_view_results` boolean
+- `POST /attempts/start` — body: `{ test_id }` — starts or resumes attempt, returns questions (no correct_option), optionOrder, test metadata
+- `PATCH /attempts/:id/answer` — body: `{ question_id, selected_option, marked_for_review? }` — rate limited (20/min per userId)
+- `GET /attempts/:id/answers` — all saved answers for this attempt
+- `GET /attempts/:id/status` — 4-state status list for pagination grid
+- `POST /attempts/:id/submit` — body: `{ reason }` — scores + closes attempt
+- `POST /attempts/:id/events` — logs cheat event (skips validateAttempt intentionally)
+- `GET /attempts/:id/results` — full breakdown, gated: internal + show_responses_to_employee=true + role=employee only
 
-4. **Per-candidate question shuffle happens ONCE, at attempt creation, not on every fetch.** The shuffled order is saved permanently to `attempts.question_order` (a JSONB array of question IDs). Resuming an attempt always re-reads this saved order — it never re-shuffles mid-attempt.
+## Key Architectural Decisions
+
+1. **JWT payload identical for all 3 roles** — `{ userId, role, name }`. Role enforcement via `requireRole` middleware, not separate auth systems.
+
+2. **Server-side timer is source of truth.** `validateAttempt` middleware recalculates elapsed time from `started_at` on every write request. Auto-submits and scores right in the middleware if expired, before route handler runs.
+
+3. **Candidates never receive `correct_option`.** `getQuestionsInOrder` helper explicitly excludes it. Admin routes include it.
+
+4. **Per-candidate question AND option shuffle, both saved once at attempt creation.** `question_order` = shuffled question ID array. `option_order` = `{ questionId: ['c','a','d','b'] }` map. Both saved to `attempts` row permanently. Resume always reads saved order — never reshuffles mid-attempt. Frontend translates clicked display position back to original letter before sending to backend — scoring logic never needs to know shuffling exists.
 
 5. **Anti-cheat is split across frontend + backend deliberately:**
-   - Frontend (`useAntiCheat` hook, not yet built): browser event listeners (`visibilitychange`, `blur`/`focus`, `beforeunload`) detect tab-switches/window changes and immediately call `/attempts/:id/submit`.
-   - Backend (`validateAttempt` middleware): the actual gatekeeper — checks ownership, status, and timer on every write request, regardless of what the frontend does. This means even a tampered frontend can't bypass the rules.
-   - `/attempts/:id/events` route deliberately skips `validateAttempt` — we want to log a cheat event even if the attempt was already closed a moment earlier (race condition safety), since it's an audit log, not a gate.
+   - Frontend (`useAntiCheat` hook): `visibilitychange`, `blur`/`focus`, `beforeunload` listeners detect tab-switches and call `/attempts/:id/submit`
+   - Backend (`validateAttempt`): gatekeeper on every write — ownership, status, timer. Fires regardless of frontend behavior.
+   - `/attempts/:id/events` deliberately skips `validateAttempt` — audit log should record even if attempt already closed.
 
-6. **Auth uses httpOnly cookies on the frontend, Bearer tokens on the backend — bridged by a proxy route.** Browser JS never has access to the raw JWT (XSS protection). `app/api/proxy/[...path]/route.ts` reads the cookie server-side and forwards requests to Express with `Authorization: Bearer <token>` attached. ALL frontend API calls go through `/api/proxy/...`, never directly to `localhost:5000`.
+6. **httpOnly cookie auth bridged to Bearer tokens via proxy.**
+   - `/api/auth/login/route.ts` — sets httpOnly cookie, browser JS never sees raw JWT
+   - `/api/proxy/[...path]/route.ts` — all JSON API calls go here, reads cookie, attaches Bearer header to Express request
+   - `/api/admin/questions/parse-upload/route.ts` — DEDICATED upload route, bypasses generic proxy entirely. Generic proxy buffers body as text which corrupts multipart streams ("Unexpected end of form"). This route streams `req.body` directly to Express with the original Content-Type header (including boundary string) preserved.
 
-7. **Admin login is a separate page (`/admin/login`), not a toggle option on the public login page.** Deliberate security choice — keeps the admin entry point undiscoverable from the candidate-facing surface.
+7. **Admin login is a separate page (`/admin/login`).** Not linked from public candidate login page. Distinct dark visual styling.
 
-8. **Database hosted on Neon (cloud), not local Postgres.** Enables developing from both home and office machines against the same data, since office PC can't push code but CAN read from the same cloud DB if `.env` is configured there too.
+8. **Internal vs External test types — 3-layer enforcement:**
+   - DB constraint: `CHECK (NOT (test_type = 'external' AND show_responses_to_employee = true))`
+   - Creation-time: `POST /admin/tests` rejects invalid combination with 400
+   - Access-time: `GET /attempts/:id/results` re-checks `test_type`, `show_responses_to_employee`, AND `req.user.role === 'employee'` — candidates can never see results even if assigned to an internal test
 
-9. **Connection pool sizing matters for the 500-concurrent-candidate target.** `pg.Pool({ max: 20, ... })` — not unlimited, not default. Combined with frontend auto-save every 20s (not per-keystroke), this keeps simultaneous DB writes manageable on modest server hardware. Node's event loop itself handles many concurrent I/O-bound connections fine even on weak hardware; the database connection pool is the actual constraint to tune.
+9. **Connection pool sized for 500 concurrent candidates.** `pg.Pool({ max: 20, idleTimeoutMillis: 30000, connectionTimeoutMillis: 5000 })`. Frontend auto-save every 20s (not per-click) keeps simultaneous writes manageable.
 
-10. **Option order is shuffled per-candidate too, same pattern as question order.** `attempts.option_order` is a JSONB map of `{ questionId: ['c','a','d','b'] }` — generated once at attempt creation, saved permanently, reused on resume. Critically, the frontend ALWAYS translates a clicked option back to its ORIGINAL letter before sending it to the backend — so `responses.selected_option` and all scoring logic never need to know shuffling exists at all. Shuffling is a presentation-only concern, fully contained in the browser.
+10. **Rate limiter keys by userId, not IP.** `keyGenerator: (req) => req.user?.userId || ipKeyGenerator(req)`. `requireAuth` runs BEFORE `answerLimiter` in the middleware chain so `req.user` exists. Uses `ipKeyGenerator` helper (not raw `req.ip`) to avoid IPv6 bypass and suppress the ERR_ERL_KEY_GEN_IPV6 warning.
 
-11. **Rate limiting applies ONLY to `/attempts/:id/answer`, never to `/submit` or `/events`.** Submit is a single critical action — rate-limiting it risks blocking a legitimate submission. The `answerLimiter` (20 req/min per IP) exists purely as a safety net against bugs/abuse, not something normal debounced auto-save (every 20s) should ever approach. Frontend treats a 429 the same as any other save failure — retries with backoff, never silently drops the pending answer.
+11. **Terminate keeps data, Restart voids attempts.** Terminate: marks in-progress attempt as `submitted + is_voided=true + submit_reason='admin_terminated'`. Restart: voids ALL existing attempts for that test+user, resets `test_assignments.attempt_status` to `'pending'`. Resume logic in `/attempts/start` naturally creates a fresh attempt since voided attempts don't match the `submit_status='in_progress'` check.
 
-## What's Done (backend — fully tested)
+12. **Dashboard LEFT JOIN uses subquery to get only the latest non-voided attempt.** Prevents duplicate rows in `completed` array when a user has multiple historical attempts (after restart+recompletion). React key collision (`Encountered two children with the same key`) was the symptom.
 
-- [x] Auth: login for all 3 roles, JWT issuance
+13. **Bulk upload does NOT save to DB.** `POST /admin/questions/parse-upload` only parses and validates, returning a preview. Admin confirms in the UI, then the normal `POST /admin/tests` is called with those questions in the body — same path as manual entry.
+
+## What's Fully Built and Verified
+
+### Backend
+- [x] Auth (all 3 roles), JWT issuance, bcrypt password hashing
 - [x] requireAuth + requireRole middleware
-- [x] Admin: create candidates (temp password), create test+questions (transaction), assign test (specific or all), view assignments
-- [x] Candidate: view assigned tests, start/resume attempt (with shuffle), save/clear answer, mark for review, question status list, submit + scoring
-- [x] validateAttempt anti-cheat middleware (ownership, status, server-timer with auto-submit)
+- [x] validateAttempt anti-cheat middleware (ownership, status, server-side timer, auto-submit)
+- [x] Admin: create candidates/employees, create tests (transaction), assign tests, view assignments
+- [x] Admin: terminate attempt, allow restart
+- [x] Admin: Excel export (flat sheet, dynamic question columns with full question text)
+- [x] Admin: question template download, bulk upload parse + validate (preview only, no DB save)
+- [x] Candidate/employee: view assigned tests, start/resume attempts, save/clear answers, review flags, question status, submit + scoring
+- [x] Internal/external test types with 3-layer visibility enforcement
+- [x] Results route gated by test_type + show_responses_to_employee + role=employee
+- [x] Rate limiting on /answer route (userId-keyed, 20/min)
 - [x] Seed script for default admin
 
-## What's Done (frontend — built AND verified working in browser)
+### Frontend
+- [x] `/login` — candidate/employee toggle
+- [x] `/admin/login` — separate dark-styled page
+- [x] `/dashboard` — pending/in-progress/completed cards, conditional View Results button
+- [x] `/test/[attemptId]` — full test-taking UI: shuffled options, 4-color pagination grid, timer, Previous/Next/Clear/Mark for Review/Submit, auto-save (20s interval + flush on navigation + retry on failure)
+- [x] `/results/[attemptId]` — full breakdown for eligible employees
+- [x] `/admin/dashboard` — 4-tab UI: Tests, Candidates, Employees, Responses
+- [x] Tests tab: create form (internal/external toggle, question builder with click-to-select-correct UX, Manual/Bulk Upload tab switcher), test list, Assign modal with today-filter
+- [x] Candidates/Employees tabs: register forms, credentials modal, tables, today-filter
+- [x] Responses tab: status table, Terminate/Restart actions, Export Excel button
+- [x] Dedicated upload route (`/api/admin/questions/parse-upload/route.ts`) streaming multipart directly to Express
+- [x] Generic proxy handles binary responses (Excel download) correctly via arrayBuffer passthrough
+- [x] `useAntiCheat` hook: visibilitychange, blur/focus with popup detection, beforeunload
 
-- [x] `/login` page — candidate/employee toggle, calls `/api/auth/login`, redirects to `/dashboard`
-- [x] `/admin/login` page — separate dark-styled page, not linked publicly
-- [x] `/dashboard` page — fetches `/tests/assigned`, renders pending/in-progress/completed sections, "Start Test" navigates to `/test/[attemptId]?testId=...`
-- [x] `middleware.ts` — verifies JWT cookie via `jose`, redirects to correct login page based on route + role
-- [x] `app/api/auth/login/route.ts` — proxies to Express, sets httpOnly cookie
-- [x] `app/api/auth/logout/route.ts` — deletes cookie
-- [x] `app/api/proxy/[...path]/route.ts` — forwards all other API calls, attaches Bearer token from cookie
-- [x] `hooks/useAntiCheat.js` — visibilitychange/blur/focus/beforeunload listeners
-- [x] **Results page (`/results/[attemptId]`) — FULLY BUILT AND VERIFIED:**
-  - Shows score + percentage + full question-by-question breakdown (your answer vs correct answer, color coded)
-  - Access gated by `test_type === 'internal' && show_responses_to_employee === true`
-  - Dashboard conditionally renders "View Results" button vs plain "Submitted" label per `can_view_results` flag
-  - Direct URL access to a disallowed attempt's results CONFIRMED blocked server-side (403), not just hidden in UI
+## What's NOT Done
 
-## Architectural Decision — Internal vs External Tests (added after initial build)
+- [ ] **Deployment** — being set up this week (see below)
+- [ ] No automated tests — all verification done manually via Thunder Client + browser
+- [ ] Bulk upload does not support adding questions to an EXISTING test — only at creation time (deliberate scope decision)
 
-**Requirement:** Two test types exist. `external` (recruitment/new joinees) — candidates NEVER see score or responses, hardcoded, not configurable. `internal` (employee training) — admin can optionally enable `show_responses_to_employee`, and if enabled, employees see a FULL breakdown (their answer + correct answer per question) after submitting.
+## Known Bugs Fixed
 
-**Schema:** `tests.test_type` (`'internal'|'external'`, default `'external'`), `tests.show_responses_to_employee` (boolean, default `false`).
-
-**Three-layer enforcement, deliberately redundant — this is the pattern to follow for any future business/fairness rule, not just this feature:**
-1. **DB constraint** — `CHECK (NOT (test_type = 'external' AND show_responses_to_employee = true))`. Physically impossible to store the invalid combination.
-2. **Creation-time validation** — `POST /admin/tests` rejects the invalid combination with a clean 400 before it ever reaches the DB constraint.
-3. **Access-time validation** — `GET /attempts/:id/results` re-checks `test_type` and `show_responses_to_employee` fresh from the DB on every request, regardless of what the frontend shows or hides. Never trust "the button wasn't rendered" as the only protection.
-
-**New routes added for this feature:**
-- `POST /admin/employees`, `GET /admin/employees` — mirrors the candidate routes but for `role = 'employee'`, using `company_id` instead of `email`. (This was a previously-missing gap — employees were assumed pre-existing but we never built a way to actually create one for testing/demo.)
-- `GET /attempts/:attemptId/results` — the gated breakdown route described above.
-- `GET /tests/assigned` updated to include `test_type`, `show_responses_to_employee`, and a computed `can_view_results` boolean per completed test, so the dashboard knows what to render without re-deriving the rule itself (though the rule is STILL re-checked server-side on the actual results route, this is just for UI convenience).
-
-## What's NOT Started
-
-- [ ] Admin: bulk Excel question upload (template download + parse-upload route — designed in detail early in the conversation, never built; not blocking, manual question entry via the Tests tab form works fine as a substitute)
-- [ ] Loading states, empty states, error boundaries — present in dashboard/test page/admin tabs at a basic level, NOT rigorously audited for every edge case (e.g. network failure mid-admin-action)
-- [ ] `keyGenerator` fix for `answerLimiter` (currently keys by IP, should key by `req.user.userId` for correctness when many candidates share an office network/IP) — discussed, not yet implemented, low urgency unless actual 500-candidate load testing surfaces it as a real issue
-- [ ] Office-PC-specific: local Postgres needs `test_type`, `show_responses_to_employee`, and the `external_never_shows_responses` constraint added (see TODOS below) — these schema changes happened after the last office sync
-- [ ] No automated tests exist anywhere (unit/integration) — everything has been manually verified via Thunder Client + browser testing. Worth flagging as a known gap if asked, not necessarily worth building out given the timeline.
-- [ ] No deployment/hosting decision made yet for the actual production environment — current setup is local dev (Neon + localhost Express/Next.js). Worth raising with manager/senior now that features are largely complete.
-
-- [x] **Admin UI — FULLY BUILT AND VERIFIED (`/admin/dashboard`, tabbed single-page):**
-  - **Tests tab**: create test form (title/description/duration/shuffle/internal-external toggle/show-responses checkbox), inline question builder (click-to-mark-correct UX, live incomplete-question warning), test list table, Assign modal (candidate+employee selection, "registered today" filter, specific-or-all modes)
-  - **Candidates tab**: register form, credentials-shown-once modal, table, "today only" filter
-  - **Employees tab**: same pattern as candidates, using `company_id` instead of email
-  - **Responses tab**: per-test assignment status table, Terminate action (voids in-progress attempt), Allow Restart action (voids attempt + resets assignment to pending), Export to Excel button
-  - All four tabs share `sharedStyles.ts` for visual consistency with the candidate-facing pages
-
-- [x] **Excel export — FULLY BUILT, ITERATED ON USER FEEDBACK, VERIFIED:**
-  - Single flat sheet (not multi-sheet — simplified per explicit user request)
-  - One row per candidate attempt: Name, Email/Company ID, Phone, Score, Submitted At
-  - One column PER QUESTION (dynamically generated), header shows full question text (e.g. "Q1: What does...") with wrapped text + tall header row, NOT just "Q1"
-  - Each question column shows the candidate's actual selected answer as readable text (e.g. "C) 32"), NOT the correct answer, NOT marks awarded — deliberately simple per user request, no scoring detail mixed into the per-question columns (score is its own separate summary column)
-
-## New backend routes added during admin UI build
-
-- `POST /admin/employees`, `GET /admin/employees` (covered earlier)
-- `POST /admin/tests/:id/terminate` — body `{ user_id }`, voids an in-progress attempt, marks submitted with `submit_reason: 'admin_terminated'`, logs to `attempt_events`
-- `POST /admin/tests/:id/restart` — body `{ user_id }`, voids ALL existing attempts for that test+user (handles multiple historical attempts), resets `test_assignments.attempt_status` back to `'pending'`. Relies on existing `/attempts/start` resume logic naturally creating a fresh attempt since voided attempts no longer match the `in_progress` resume check — no extra logic needed there.
-- `GET /admin/tests/:id/export` — the flat single-sheet Excel export described above. Uses `exceljs`, builds columns dynamically based on question count, response lookup keyed by `${attempt_id}_${question_id}` for O(1) lookups while building rows.
-
-## Known Gotchas / Bugs Already Fixed (continued)
-
-7. **TypeScript syntax leaking into plain `.js` backend files (fixed):** Accidentally included `: Record<string, any>`, `: any`, `: number` type annotations in `apps/api/routes/admin.js` (a plain Node.js file, not TypeScript). Node's ESM loader crashes immediately on this with `SyntaxError: Missing initializer in const declaration`. Lesson: backend files are plain `.js`, never paste TypeScript-flavored code there even as a copy-paste artifact from a `.tsx` context.
-8. **`middleware.ts` → `proxy.ts` rename (Next.js 16):** Next.js renamed the middleware file convention; `middleware.ts` still works but is deprecated. Renamed file to `proxy.ts` and the exported function from `middleware` to `proxy` — everything else (matcher config, JWT verification logic) unchanged.
-9. **Proxy route crashed on binary file responses (fixed):** `app/api/proxy/[...path]/route.ts` unconditionally called `expressRes.json()` on every response, which crashed on the Excel export route's binary `.xlsx` bytes (`SyntaxError: Unexpected token 'P', "PK..."` — PK is the ZIP file signature Excel files start with). Fixed by checking `Content-Type` header: if not `application/json`, stream raw bytes through via `arrayBuffer()` instead, preserving `Content-Disposition` so the browser still triggers a proper file download.
-10. **Multi-tab/multi-role testing logs you out unexpectedly — NOT a bug, expected cookie behavior.** Logging in as admin in one tab overwrites the SAME `token` cookie a candidate tab was relying on (cookies are domain-scoped, not tab-scoped). Refreshing the candidate tab afterward sends the admin's token, which `requireRole` correctly rejects, bouncing back to login. Fix for testing: use two different browsers, or one normal + one Incognito window, never two tabs of the same browser for two different roles simultaneously. This is not an issue in real usage since admin and candidates are different people on different physical machines.
-
-## Current Overall Status — nearly feature-complete
-
-**Fully working end-to-end:** auth (3 roles), candidate/employee dashboard, full test-taking UI (shuffle, option-shuffle, review flags, pagination, anti-cheat, auto-save+retry, server-side timer), gated results viewing (internal/external test types), and the FULL admin UI (candidates, employees, tests w/ question builder, assignment, responses w/ terminate+restart, Excel export).
-
-**What remains (see "What's NOT Started" above, and TODOS below) is smaller, more "polish and hardening" than "new features."**
-
-## TODOS for next office session (no AI/push access)
-
-Given the project is now feature-complete on both candidate and admin sides, office time should focus on HARDENING and TESTING, not new features.
-
-1. **Sync local Postgres schema with Neon.** Several changes happened since office Postgres was last touched: `test_type`, `show_responses_to_employee` on `tests`, plus the `external_never_shows_responses` constraint. Run in pgAdmin Query Tool:
-   ```sql
-   ALTER TABLE tests ADD COLUMN IF NOT EXISTS test_type VARCHAR(20) NOT NULL DEFAULT 'external'
-     CHECK (test_type IN ('internal', 'external'));
-   ALTER TABLE tests ADD COLUMN IF NOT EXISTS show_responses_to_employee BOOLEAN NOT NULL DEFAULT false;
-   ALTER TABLE tests ADD CONSTRAINT external_never_shows_responses
-     CHECK (NOT (test_type = 'external' AND show_responses_to_employee = true));
-   ```
-
-2. **Full regression pass on local Postgres** — login → create test → register candidate/employee → assign → take test as that user → check Responses tab updates → export Excel — confirm everything still works against office's local DB.
-
-3. **Heavy manual QA / edge-case hunting** — genuinely valuable office time:
-   - Multiple candidates/employees taking the SAME test simultaneously (several incognito windows) — watch for data crossing between attempts
-   - Terminate an attempt WHILE that candidate still has the test open elsewhere — does their next save/submit correctly get rejected?
-   - Restart a test, confirm the candidate gets a genuinely NEW shuffle order, not the old one
-   - Try assigning a test to zero people — confirm it's blocked cleanly
-   - Export Excel for a test with ZERO submitted attempts — confirm no crash
-
-4. **Decide with manager: what's the actual MVP cutoff for demo day?** Use the "What's NOT Started" list above to explicitly separate must-haves from nice-to-haves.
-
-5. **Do NOT start bulk Excel question upload today** — new feature requiring multer + parsing, better suited for an AI-assisted home session.
+1. `TIMESTAMP` → `TIMESTAMPTZ` — server-side timer miscalculated by hours due to timezone parsing
+2. Timer `00:00` on resume — resume branch of `/attempts/start` wasn't returning `test.duration_minutes`
+3. TypeScript annotations in `.js` backend file — Node crashed with `SyntaxError: Missing initializer`
+4. `middleware.ts` → `proxy.ts` rename — Next.js 16 deprecation
+5. Generic proxy crashed on Excel binary response — was calling `.json()` on binary bytes; fixed with `arrayBuffer()` passthrough
+6. `.env` in wrong folder — must be `apps/api/.env`, not repo root
+7. Duplicate key React error after restart+recompletion — LEFT JOIN was returning multiple attempt rows; fixed with subquery getting only latest non-voided attempt
+8. Rate limiter IPv6 warning — replaced `req.ip` with `ipKeyGenerator(req)` from express-rate-limit
+9. "Unexpected end of form" on file upload — generic proxy was buffering multipart body as text, corrupting the stream; fixed with dedicated `/api/admin/questions/parse-upload/route.ts` that streams `req.body` directly
+10. Candidates could see internal test results — `can_view_results` and results route both missing `role === 'employee'` check
 
 ## Environment Variables
 
-**apps/api/.env**
+### apps/api/.env
 ```
-DATABASE_URL=<neon connection string, pooled>
-JWT_SECRET=<shared secret, must match web's .env.local exactly>
+DATABASE_URL=<neon pooled connection string>
+JWT_SECRET=<32+ char secret, must match web exactly>
 PORT=5000
-CLIENT_URL=http://localhost:3000
-SEED_ADMIN_EMAIL=...
-SEED_ADMIN_PASSWORD=...
-SEED_ADMIN_NAME=...
+CLIENT_URL=http://localhost:3000  (dev) | http://<SERVER_IP>:3000 (prod)
+SEED_ADMIN_EMAIL=admin@samsung.com
+SEED_ADMIN_PASSWORD=<your password>
+SEED_ADMIN_NAME=Samsung Admin
 ```
 
-**apps/web/.env.local**
+### apps/web/.env.local
 ```
-NEXT_PUBLIC_API_URL=http://localhost:5000
-API_URL=http://localhost:5000
-JWT_SECRET=<MUST match api's JWT_SECRET exactly>
+NEXT_PUBLIC_API_URL=http://localhost:5000  (dev) | http://<SERVER_IP>:5000 (prod)
+API_URL=http://localhost:5000  (dev) | http://localhost:5000 (prod — same machine, localhost is correct)
+JWT_SECRET=<MUST match api JWT_SECRET exactly>
 ```
 
-## Known Gotchas / Bugs Already Fixed
+## Deployment Plan (Windows Office Server, LAN-only)
 
-1. **Timezone bug (fixed):** Postgres `TIMESTAMP` (no timezone) columns caused JS `Date` parsing to misread elapsed time by several hours in some code paths. Fixed by migrating all timestamp columns to `TIMESTAMPTZ`. Lesson: always use `TIMESTAMPTZ` for anything timer-related.
-2. **Timer showing 00:00 on resume (fixed):** the RESUME branch of `POST /attempts/start` didn't return the `test` object at all (only `attempt`, `questions`, `optionOrder`), so frontend's `durationMinutes` state had nothing to read on resume. Fixed by also returning `test: { title, duration_minutes }` in the resume branch, mirroring the fresh-start branch.
-3. **`.env` location matters:** must live in `apps/api/.env`, NOT the monorepo root — `dotenv.config()` resolves relative to where `node` is actually run from.
-4. **PATCH vs POST, singular vs plural route confusion:** `/attempts/:id/answer` (singular, PATCH) saves one answer. `/attempts/:id/answers` (plural, GET) lists all saved answers. Easy to typo.
-5. **bcrypt hashes are one-way** — if a temp password is lost, there is no recovery; must issue a new one.
-6. **Missing employee-creation route (fixed):** `POST /admin/candidates` only ever created `role='candidate'` rows. There was no way to create an employee for testing until `POST /admin/employees` was added.
+### One-time server setup
+```bash
+# 1. Install Node.js LTS from nodejs.org
+# 2. Install Git from git-scm.com
+# 3. Clone the repo
+git clone https://github.com/tejaswmishra/test-platform.git
+cd test-platform
 
-## Coding Conventions Used So Far
+# 4. Install dependencies
+cd apps/api && npm install
+cd ../web && npm install
 
-- Express routes always validate input before touching the DB, return early with 400 on bad input.
-- All multi-step writes (test+questions creation) use explicit `BEGIN`/`COMMIT`/`ROLLBACK` transactions via `pool.connect()` → `client.query()` → `client.release()`.
-- Every route wrapped in try/catch, logs the error server-side, returns a generic `{ error: "..." }` message to the client (never leaks raw DB errors to the frontend).
-- `req.app.locals.pool` is how route files access the shared DB connection pool (set once in `index.js`).
-- Middleware factory pattern used for `requireRole(...roles)` — returns a middleware function, allows flexible role lists per-route.
+# 5. Create .env files (see Environment Variables above, use SERVER_IP)
+# 6. Run database migration (Neon — already has schema, just verify)
+cd apps/api && node db/migrate.js
+# 7. Seed admin account
+node db/seed.js
+
+# 8. Build Next.js for production
+cd ../web && npm run build
+# Fix any build errors before proceeding
+
+# 9. Install PM2
+npm install -g pm2
+
+# 10. Start both processes
+cd ../api && pm2 start index.js --name "test-platform-api"
+cd ../web && pm2 start npm --name "test-platform-web" -- start
+
+# 11. Save + configure auto-start on boot
+pm2 save
+pm2 startup  # run the command it prints
+
+# 12. Open firewall ports (Windows Defender Firewall → Inbound Rules)
+# Port 3000 TCP — "Test Platform Web"
+# Port 5000 TCP — "Test Platform API"
+```
+
+### Verify deployment
+From another machine on the LAN: `http://<SERVER_IP>:3000` should show login page.
+
+### Updating the deployment after code changes
+```bash
+git pull origin main
+cd apps/api && npm install   # if new packages added
+cd ../web && npm install && npm run build
+pm2 restart all
+```
+
+## Office TODO for Tomorrow
+
+### Priority 1 — Run production build check AT HOME TONIGHT first
+```bash
+cd apps/web
+npm run build
+```
+Fix any TypeScript/build errors before going to the server. Much easier to debug at home with AI access than on the server under time pressure.
+
+### Priority 2 — Server setup (in this exact order)
+1. Install Node.js LTS on the server
+2. Install Git on the server
+3. Clone the repo
+4. `npm install` in both `apps/api` and `apps/web`
+5. Create both `.env` files with the SERVER_IP (not localhost)
+6. `node db/migrate.js` — confirm tables exist on Neon (should already be there)
+7. `node db/seed.js` — creates production admin account
+8. `npm run build` in `apps/web` — must succeed with zero errors
+9. Install PM2 globally
+10. Start both processes with PM2
+11. `pm2 save` + run the `pm2 startup` command
+12. Open ports 3000 and 5000 in Windows Firewall
+13. Test from another LAN machine
+
+### Priority 3 — Full smoke test on production
+- Login as admin → create a test → register a candidate → assign → take test as that candidate → check Responses tab → export Excel
+- Confirm anti-cheat fires correctly (tab switch)
+- Confirm timer works correctly
+
+### Things that can go wrong and how to fix them
+- **Build errors** — TypeScript strict mode surfaces issues dev mode tolerates. Fix the specific file/line the build output points to.
+- **PM2 not found after install** — close and reopen terminal (PATH needs refresh)
+- **Port already in use** — another process is on 3000 or 5000. `netstat -ano | findstr :3000` to find and kill it.
+- **Candidates can't reach the server** — firewall ports not open, or they're using the wrong IP. Confirm with `ipconfig` on the server to get the exact LAN IP.
+- **`pm2 startup` doesn't work on Windows** — PM2's startup command works differently on Windows. Alternative: create a Windows Task Scheduler task to run `pm2 resurrect` on login/startup.

@@ -133,7 +133,10 @@ export default function TestsTab() {
   );
 }
 
-// ── Create Test Modal ─────────────────────────────────────────────
+// Replace ONLY the CreateTestModal function in your existing TestsTab.tsx.
+// Everything else in that file (TestsTab, QuestionEditor, AssignTestModal,
+// checkRowStyle) stays exactly the same — do not touch those.
+
 function CreateTestModal({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
@@ -143,6 +146,12 @@ function CreateTestModal({ onClose, onCreated }: { onClose: () => void; onCreate
   const [showResponses, setShowResponses] = useState(false);
   const [questions, setQuestions] = useState<QuestionDraft[]>([emptyQuestion()]);
   const [saving, setSaving] = useState(false);
+
+  // Bulk upload state
+  const [inputMode, setInputMode] = useState<'manual' | 'bulk'>('manual');
+  const [uploading, setUploading] = useState(false);
+  const [uploadPreview, setUploadPreview] = useState<QuestionDraft[] | null>(null);
+  const [uploadErrors, setUploadErrors] = useState<{ row: number; errors: string[] }[]>([]);
 
   const totalMarks = questions.reduce((sum, q) => sum + (q.marks || 0), 0);
   const incompleteCount = questions.filter(
@@ -161,9 +170,68 @@ function CreateTestModal({ onClose, onCreated }: { onClose: () => void; onCreate
     setQuestions((prev) => prev.filter((_, i) => i !== index));
   }
 
+  async function handleDownloadTemplate() {
+    window.open('/api/proxy/admin/question-template', '_blank');
+  }
+
+  async function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setUploading(true);
+    setUploadPreview(null);
+    setUploadErrors([]);
+
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+
+      // Note: don't set Content-Type manually for FormData — browser sets it
+      // automatically with the correct multipart boundary string
+      const res = await fetch('/api/admin/questions/parse-upload', {
+        method: 'POST',
+        body: formData,
+    });
+      const data = await res.json();
+
+      if (!res.ok) {
+        alert(data.error || 'Failed to parse file');
+        return;
+      }
+
+      setUploadPreview(data.questions);
+      setUploadErrors(data.errors);
+
+      // If all questions parsed cleanly, immediately use them as the
+      // working question list so the admin can confirm and submit
+      if (data.errors.length === 0 && data.questions.length > 0) {
+        setQuestions(data.questions);
+      }
+
+    } catch (err) {
+      alert('Unable to reach the server.');
+    } finally {
+      setUploading(false);
+      // Reset the file input so the same file can be re-uploaded if edited
+      e.target.value = '';
+    }
+  }
+
+  function handleConfirmBulk() {
+    if (!uploadPreview || uploadPreview.length === 0) return;
+    setQuestions(uploadPreview);
+    setInputMode('manual'); // switch back to manual so admin can review/edit
+    setUploadPreview(null);
+    setUploadErrors([]);
+  }
+
   async function handleSubmit() {
     if (incompleteCount > 0) {
       alert(`${incompleteCount} question(s) are incomplete — fill in all options and select a correct answer.`);
+      return;
+    }
+    if (questions.length === 0) {
+      alert('Add at least one question before creating the test.');
       return;
     }
 
@@ -201,16 +269,15 @@ function CreateTestModal({ onClose, onCreated }: { onClose: () => void; onCreate
       <div style={{ ...s.modalContent, maxWidth: 720 }} onClick={(e) => e.stopPropagation()}>
         <h3 style={s.sectionTitle}>Create Test</h3>
 
+        {/* Test metadata */}
         <div style={s.field}>
           <label style={s.label}>Title</label>
           <input style={s.input} value={title} onChange={(e) => setTitle(e.target.value)} required />
         </div>
-
         <div style={s.field}>
           <label style={s.label}>Description (optional)</label>
           <input style={s.input} value={description} onChange={(e) => setDescription(e.target.value)} />
         </div>
-
         <div style={{ display: 'flex', gap: 16, marginBottom: 14 }}>
           <div style={{ ...s.field, flex: 1, marginBottom: 0 }}>
             <label style={s.label}>Duration (minutes)</label>
@@ -234,46 +301,151 @@ function CreateTestModal({ onClose, onCreated }: { onClose: () => void; onCreate
             </select>
           </div>
         </div>
-
         <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10, fontSize: 13 }}>
           <input type="checkbox" checked={shuffleQuestions} onChange={(e) => setShuffleQuestions(e.target.checked)} />
           Shuffle question order per candidate
         </label>
-
         {testType === 'internal' && (
           <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 20, fontSize: 13 }}>
             <input type="checkbox" checked={showResponses} onChange={(e) => setShowResponses(e.target.checked)} />
-            Allow employees to view their score and answer breakdown after submitting
+            Allow employees to view score and answer breakdown after submitting
           </label>
         )}
 
+        {/* Question input section */}
         <div style={{ borderTop: '1px solid #E5E7EB', paddingTop: 16, marginTop: 8 }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 12 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
             <h4 style={{ fontSize: 13, fontWeight: 600, color: '#374151', margin: 0 }}>Questions</h4>
-            <span style={{ fontSize: 12, color: '#6B7280' }}>
+
+            {/* Manual / Bulk Upload toggle */}
+            <div style={{ display: 'flex', backgroundColor: '#F3F4F6', borderRadius: 6, padding: 3, gap: 2 }}>
+              <button
+                type="button"
+                onClick={() => setInputMode('manual')}
+                style={{
+                  padding: '5px 12px', borderRadius: 4, border: 'none', fontSize: 12, fontWeight: 500, cursor: 'pointer',
+                  backgroundColor: inputMode === 'manual' ? '#FFFFFF' : 'transparent',
+                  color: inputMode === 'manual' ? '#111827' : '#6B7280',
+                  boxShadow: inputMode === 'manual' ? '0 1px 2px rgba(0,0,0,0.06)' : 'none',
+                }}
+              >
+                Manual
+              </button>
+              <button
+                type="button"
+                onClick={() => setInputMode('bulk')}
+                style={{
+                  padding: '5px 12px', borderRadius: 4, border: 'none', fontSize: 12, fontWeight: 500, cursor: 'pointer',
+                  backgroundColor: inputMode === 'bulk' ? '#FFFFFF' : 'transparent',
+                  color: inputMode === 'bulk' ? '#111827' : '#6B7280',
+                  boxShadow: inputMode === 'bulk' ? '0 1px 2px rgba(0,0,0,0.06)' : 'none',
+                }}
+              >
+                Bulk Upload
+              </button>
+            </div>
+          </div>
+
+          {/* Summary line — always visible regardless of mode */}
+          {questions.length > 0 && (
+            <p style={{ fontSize: 12, color: '#6B7280', margin: '0 0 12px 0' }}>
               {questions.length} question(s) · {totalMarks} total marks
               {incompleteCount > 0 && (
                 <span style={{ color: '#DC2626', marginLeft: 8 }}>⚠ {incompleteCount} incomplete</span>
               )}
-            </span>
-          </div>
+            </p>
+          )}
 
-          {questions.map((q, idx) => (
-            <QuestionEditor
-              key={idx}
-              index={idx}
-              question={q}
-              onChange={(patch) => updateQuestion(idx, patch)}
-              onRemove={() => removeQuestion(idx)}
-              canRemove={questions.length > 1}
-            />
-          ))}
+          {/* Manual mode */}
+          {inputMode === 'manual' && (
+            <>
+              {questions.map((q, idx) => (
+                <QuestionEditor
+                  key={idx}
+                  index={idx}
+                  question={q}
+                  onChange={(patch) => updateQuestion(idx, patch)}
+                  onRemove={() => removeQuestion(idx)}
+                  canRemove={questions.length > 1}
+                />
+              ))}
+              <button type="button" onClick={addQuestion} style={{ ...s.secondaryBtn, width: '100%', marginTop: 8 }}>
+                + Add Question
+              </button>
+            </>
+          )}
 
-          <button type="button" onClick={addQuestion} style={{ ...s.secondaryBtn, width: '100%', marginTop: 8 }}>
-            + Add Question
-          </button>
+          {/* Bulk upload mode */}
+          {inputMode === 'bulk' && (
+            <div style={{ padding: '16px', backgroundColor: '#F9FAFB', borderRadius: 8, border: '1px solid #E5E7EB' }}>
+              <p style={{ fontSize: 13, color: '#374151', margin: '0 0 12px 0' }}>
+                Download the template, fill it in with your questions, then upload it back.
+              </p>
+
+              <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
+                <button type="button" onClick={handleDownloadTemplate} style={s.secondaryBtn}>
+                  ↓ Download Template
+                </button>
+                <label style={{ ...s.primaryBtn, cursor: 'pointer', display: 'inline-block' }}>
+                  {uploading ? 'Parsing...' : '↑ Upload Filled File'}
+                  <input
+                    type="file"
+                    accept=".xlsx"
+                    onChange={handleFileUpload}
+                    disabled={uploading}
+                    style={{ display: 'none' }}
+                  />
+                </label>
+              </div>
+
+              {/* Row-level errors */}
+              {uploadErrors.length > 0 && (
+                <div style={{ marginBottom: 12 }}>
+                  <p style={{ fontSize: 12, fontWeight: 600, color: '#DC2626', margin: '0 0 6px 0' }}>
+                    {uploadErrors.length} row(s) had errors and were skipped:
+                  </p>
+                  <div style={{ maxHeight: 120, overflowY: 'auto', backgroundColor: '#FEF2F2', borderRadius: 6, padding: 10 }}>
+                    {uploadErrors.map((e, i) => (
+                      <p key={i} style={{ fontSize: 12, color: '#991B1B', margin: '0 0 4px 0' }}>
+                        Row {e.row}: {e.errors.join(', ')}
+                      </p>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Parsed preview */}
+              {uploadPreview !== null && (
+                <div>
+                  <p style={{ fontSize: 12, fontWeight: 600, color: '#065F46', margin: '0 0 8px 0' }}>
+                    ✓ {uploadPreview.length} question(s) parsed successfully
+                  </p>
+                  <div style={{ maxHeight: 160, overflowY: 'auto', backgroundColor: '#F0FDF4', borderRadius: 6, padding: 10, marginBottom: 10 }}>
+                    {uploadPreview.map((q, i) => (
+                      <p key={i} style={{ fontSize: 12, color: '#166534', margin: '0 0 4px 0' }}>
+                        Q{i + 1}: {q.question_text}
+                      </p>
+                    ))}
+                  </div>
+                  {uploadPreview.length > 0 && (
+                    <button type="button" onClick={handleConfirmBulk} style={s.primaryBtn}>
+                      Use these {uploadPreview.length} question(s)
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {/* If questions were already confirmed from a previous upload */}
+              {uploadPreview === null && questions.length > 0 && questions[0].question_text !== '' && (
+                <p style={{ fontSize: 12, color: '#059669', margin: 0 }}>
+                  ✓ {questions.length} question(s) loaded from upload. Switch to Manual tab to review or edit them.
+                </p>
+              )}
+            </div>
+          )}
         </div>
 
+        {/* Footer actions */}
         <div style={{ display: 'flex', gap: 8, marginTop: 24, borderTop: '1px solid #E5E7EB', paddingTop: 16 }}>
           <button type="button" onClick={onClose} style={s.secondaryBtn}>
             Cancel
@@ -286,6 +458,7 @@ function CreateTestModal({ onClose, onCreated }: { onClose: () => void; onCreate
     </div>
   );
 }
+
 
 function QuestionEditor({
   index, question, onChange, onRemove, canRemove,

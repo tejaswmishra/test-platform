@@ -1,6 +1,7 @@
 import express from 'express';
 import bcrypt from 'bcryptjs';
 import ExcelJS from 'exceljs';
+import multer from 'multer';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 
 const router = express.Router();
@@ -552,5 +553,162 @@ router.get('/employees', requireAuth, requireRole('admin'), async (req, res) => 
     res.status(500).json({ error: 'Failed to fetch employees' });
   }
 });
+
+
+// Add both routes to apps/api/routes/admin.js
+// Also add this import at the top of admin.js if not already there:
+// import multer from 'multer';
+// import ExcelJS from 'exceljs';
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB max
+  fileFilter: (req, file, cb) => {
+    const allowed = [
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'application/vnd.ms-excel',
+    ];
+    if (allowed.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only .xlsx files are allowed'), false);
+    }
+  },
+});
+
+// GET /admin/question-template
+// Downloads a pre-filled sample Excel template showing admin
+// exactly what format to use when bulk uploading questions.
+router.get('/question-template', requireAuth, requireRole('admin'), async (req, res) => {
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet('Questions');
+
+  ws.columns = [
+    { header: 'question_text', key: 'question_text', width: 50 },
+    { header: 'option_a',      key: 'option_a',      width: 25 },
+    { header: 'option_b',      key: 'option_b',      width: 25 },
+    { header: 'option_c',      key: 'option_c',      width: 25 },
+    { header: 'option_d',      key: 'option_d',      width: 25 },
+    { header: 'correct_option', key: 'correct_option', width: 14 },
+    { header: 'marks',         key: 'marks',          width: 8  },
+  ];
+
+  // Style header row
+  ws.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
+  ws.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A56DB' } };
+
+  // One sample row so admin immediately understands the format
+  ws.addRow({
+    question_text: 'What does HTML stand for?',
+    option_a: 'Hyper Text Markup Language',
+    option_b: 'High Tech Modern Language',
+    option_c: 'Hyper Transfer Markup Language',
+    option_d: 'Home Tool Markup Language',
+    correct_option: 'a',
+    marks: 1,
+  });
+
+  // Add dropdown validation on correct_option column so Excel
+  // itself guides admin to pick only valid values
+  ws.getColumn(6).eachCell({ includeEmpty: false }, (cell, rowNum) => {
+    if (rowNum === 1) return;
+    cell.dataValidation = {
+      type: 'list',
+      formulae: ['"a,b,c,d"'],
+      showErrorMessage: true,
+      errorTitle: 'Invalid option',
+      error: 'Must be exactly: a, b, c, or d (lowercase)',
+    };
+  });
+
+  res.setHeader('Content-Disposition', 'attachment; filename="question-template.xlsx"');
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  await wb.xlsx.write(res);
+  res.end();
+});
+
+// POST /admin/questions/parse-upload
+// Accepts an uploaded .xlsx file, parses every row, validates each one,
+// and returns a PREVIEW of parsed questions plus any errors found.
+// Does NOT save anything to the database — that happens only when
+// admin confirms and the full POST /admin/tests is called with these
+// questions in the body, exactly like the manual flow.
+router.post(
+  '/questions/parse-upload',
+  requireAuth,
+  requireRole('admin'),
+  upload.single('file'),
+  async (req, res) => {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    try {
+      const wb = new ExcelJS.Workbook();
+      await wb.xlsx.load(req.file.buffer);
+      const ws = wb.worksheets[0];
+
+      const questions = [];
+      const errors = [];
+
+      ws.eachRow((row, rowNum) => {
+        if (rowNum === 1) return; // skip header
+
+        // row.values is 1-indexed, index 0 is undefined
+        const [, question_text, option_a, option_b, option_c, option_d,
+               correct_option, marks] = row.values;
+
+        // Skip completely empty rows silently
+        if (!question_text && !option_a && !option_b) return;
+
+        const rowErrors = [];
+
+        if (!question_text || String(question_text).trim() === '') {
+          rowErrors.push('Question text is empty');
+        }
+        if (!option_a || String(option_a).trim() === '') rowErrors.push('Option A is empty');
+        if (!option_b || String(option_b).trim() === '') rowErrors.push('Option B is empty');
+        if (!option_c || String(option_c).trim() === '') rowErrors.push('Option C is empty');
+        if (!option_d || String(option_d).trim() === '') rowErrors.push('Option D is empty');
+
+        const correctStr = correct_option ? String(correct_option).trim().toLowerCase() : '';
+        if (!['a', 'b', 'c', 'd'].includes(correctStr)) {
+          rowErrors.push(`correct_option must be a, b, c, or d — got "${correct_option ?? 'empty'}"`);
+        }
+
+        const marksNum = Number(marks);
+        if (!marks || isNaN(marksNum) || marksNum < 1) {
+          rowErrors.push('marks must be a number ≥ 1');
+        }
+
+        if (rowErrors.length > 0) {
+          errors.push({ row: rowNum, errors: rowErrors });
+        } else {
+          questions.push({
+            question_text: String(question_text).trim(),
+            option_a: String(option_a).trim(),
+            option_b: String(option_b).trim(),
+            option_c: String(option_c).trim(),
+            option_d: String(option_d).trim(),
+            correct_option: correctStr,
+            marks: marksNum,
+          });
+        }
+      });
+
+      res.json({
+        questions,        // valid parsed questions — ready to use in POST /admin/tests
+        errors,           // row-level validation errors to show admin
+        total: questions.length,
+        errorCount: errors.length,
+      });
+
+    } catch (err) {
+      console.error('Parse upload error:', err.message);
+      res.status(500).json({ error: 'Failed to parse the uploaded file. Make sure it is a valid .xlsx file.' });
+    }
+  }
+);
+
 
 export default router;

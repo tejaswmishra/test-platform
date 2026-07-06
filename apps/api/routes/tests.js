@@ -31,7 +31,14 @@ router.get('/assigned', requireAuth, requireRole('candidate', 'employee'), async
          a.submit_reason
        FROM test_assignments ta
        JOIN tests t ON t.id = ta.test_id
-       LEFT JOIN attempts a ON a.test_id = ta.test_id AND a.user_id = ta.user_id
+       LEFT JOIN attempts a ON a.id = (
+          SELECT id FROM attempts 
+          WHERE test_id = ta.test_id 
+          AND user_id = ta.user_id 
+          AND is_voided = false
+          ORDER BY created_at DESC 
+          LIMIT 1
+       )
        WHERE ta.user_id = $1
        ORDER BY ta.assigned_at DESC`,
       [userId]
@@ -47,7 +54,7 @@ router.get('/assigned', requireAuth, requireRole('candidate', 'employee'), async
       .filter(r => r.attempt_status === 'submitted')
       .map(r => ({
         ...r,
-        can_view_results: r.test_type === 'internal' && r.show_responses_to_employee,
+        can_view_results: r.test_type === 'internal' && r.show_responses_to_employee && r.role === 'employee',
       }));
 
     res.json({ pending, inProgress, completed });

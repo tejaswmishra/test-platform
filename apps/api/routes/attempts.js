@@ -5,7 +5,7 @@
 import express from 'express';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 import { validateAttempt, calculateScore } from '../middleware/antiCheat.js';
-import rateLimit from 'express-rate-limit';
+import rateLimit, {ipKeyGenerator} from 'express-rate-limit';
 
 const router = express.Router();
 
@@ -18,22 +18,9 @@ const answerLimiter = rateLimit({
   max: 20,                // 20 saves per minute per IP is very generous
   standardHeaders: true,
   legacyHeaders: false,
+  keyGenerator: (req) => req.user?.userId || ipKeyGenerator(req), // Use userId if available, else fallback to IP
   message: { error: 'Too many save requests, please slow down' },
 });
- 
-// Then apply it ONLY to the answer route, like this:
-//
-// router.patch(
-//   '/:attemptId/answer',
-//   answerLimiter,              // ← add this here
-//   requireAuth,
-//   requireRole('candidate', 'employee'),
-//   validateAttempt,
-//   async (req, res) => { ... }
-// );
-//
-// Do NOT add it to /submit or /events — those should never be
-// rate-limited, since submit is a single critical one-time action.
 
 router.post('/start', requireAuth, requireRole('candidate', 'employee'), async (req, res) => {
   const { pool } = req.app.locals;
@@ -60,7 +47,6 @@ router.post('/start', requireAuth, requireRole('candidate', 'employee'), async (
       return res.status(403).json({ error: 'You have already submitted this test' });
     }
  
-    // ── Resume path — reuse the SAME saved question order AND option order ──
     const existingAttempt = await pool.query(
       `SELECT * FROM attempts WHERE test_id = $1 AND user_id = $2 AND submit_status = 'in_progress'`,
       [test_id, userId]
@@ -97,13 +83,7 @@ router.post('/start', requireAuth, requireRole('candidate', 'employee'), async (
     if (test.shuffle_questions) {
       questionOrder = fisherYatesShuffle(questionOrder);
     }
- 
-    // NEW — build a per-question option shuffle map.
-    // Each question gets its OWN independent shuffle of ['a','b','c','d'].
-    // This is intentionally generated regardless of shuffle_questions —
-    // option shuffling and question shuffling are independent settings.
-    // If you want option shuffling to be optional too, gate this behind
-    // its own flag later (e.g. test.shuffle_options).
+
     const optionOrder = {};
     for (const qId of questionOrder) {
       optionOrder[qId] = fisherYatesShuffle(['a', 'b', 'c', 'd']);
@@ -147,6 +127,7 @@ router.post('/start', requireAuth, requireRole('candidate', 'employee'), async (
 router.patch(
   '/:attemptId/answer',
   requireAuth,
+  answerLimiter,
   requireRole('candidate', 'employee'),
   validateAttempt,
   async (req, res) => {
@@ -407,7 +388,7 @@ router.get(
       }
  
       // THE ACTUAL RULE — enforced here, not just hidden in the UI
-      if (attempt.test_type !== 'internal' || !attempt.show_responses_to_employee) {
+      if (attempt.test_type !== 'internal' || !attempt.show_responses_to_employee || req.user.role !== 'employee') {
         return res.status(403).json({ error: 'Results are not available for this test' });
       }
  
@@ -442,8 +423,6 @@ router.get(
   }
 );
  
-
-
 // Standard Fisher-Yates shuffle — unbiased, O(n), the correct way to
 // shuffle an array (never use .sort(() => Math.random() - 0.5), it's biased)
 function fisherYatesShuffle(array) {

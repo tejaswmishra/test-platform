@@ -3,10 +3,13 @@ import { NextRequest, NextResponse } from 'next/server';
 // Catch-all proxy: forwards any /api/proxy/* request to Express,
 // attaching the JWT from the httpOnly cookie as a Bearer header.
 //
-// IMPORTANT: not every Express response is JSON. The Excel export
-// route returns raw binary file bytes (.xlsx), so we check the
-// Content-Type header and handle binary responses differently —
-// streaming the raw bytes through instead of trying to JSON.parse them.
+// File uploads (multipart) are handled by a dedicated route at
+// /api/admin/questions/parse-upload — NOT through this proxy,
+// since buffering multipart streams here corrupts them.
+//
+// Binary file RESPONSES (e.g. Excel export) are still handled here —
+// we check the response Content-Type and stream raw bytes through
+// instead of trying to JSON.parse them.
 
 async function handler(req: NextRequest, { params }: { params: Promise<{ path: string[] }> }) {
   const { path } = await params;
@@ -14,6 +17,8 @@ async function handler(req: NextRequest, { params }: { params: Promise<{ path: s
   const targetPath = path.join('/');
   const queryString = req.nextUrl.search;
 
+  // All requests through this proxy are JSON — multipart uploads
+  // have their own dedicated route and never reach here
   const body = ['GET', 'HEAD'].includes(req.method) ? undefined : await req.text();
 
   try {
@@ -26,18 +31,16 @@ async function handler(req: NextRequest, { params }: { params: Promise<{ path: s
       body,
     });
 
-    const contentType = expressRes.headers.get('content-type') || '';
+    const responseContentType = expressRes.headers.get('content-type') || '';
 
-    // Binary / file responses (Excel, PDF, images, etc.) — stream raw bytes
-    // through unchanged, preserving headers like Content-Disposition so the
-    // browser still knows to trigger a file download with the right filename.
-    const isBinary = !contentType.includes('application/json');
+    // Binary responses (Excel, PDF, etc.) — stream raw bytes through unchanged,
+    // preserving Content-Disposition so the browser triggers a file download
+    const isBinary = !responseContentType.includes('application/json');
 
     if (isBinary) {
       const arrayBuffer = await expressRes.arrayBuffer();
       const responseHeaders = new Headers();
 
-      // Forward the headers that matter for file downloads
       const passthroughHeaders = ['content-type', 'content-disposition', 'content-length'];
       for (const key of passthroughHeaders) {
         const value = expressRes.headers.get(key);
@@ -50,7 +53,7 @@ async function handler(req: NextRequest, { params }: { params: Promise<{ path: s
       });
     }
 
-    // Normal JSON response — same behavior as before
+    // Normal JSON response
     const data = await expressRes.json();
     return NextResponse.json(data, { status: expressRes.status });
 
