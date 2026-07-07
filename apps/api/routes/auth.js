@@ -77,4 +77,53 @@ router.post('/login', async (req, res) => {
   }
 });
 
+// POST /auth/register
+// Self-registration for candidates on test day.
+// No admin involvement — candidate fills their own details and password.
+router.post('/register', async (req, res) => {
+  const { pool } = req.app.locals;
+  const { name, email, phone, password } = req.body;
+
+  if (!name || !email || !phone || !password) {
+    return res.status(400).json({ error: 'name, email, phone and password are all required' });
+  }
+
+  if (password.length < 6) {
+    return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  }
+
+  try {
+    const existing = await pool.query(
+      `SELECT id FROM users WHERE email = $1`, [email]
+    );
+
+    if (existing.rows.length > 0) {
+      return res.status(409).json({ error: 'An account with this email already exists' });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    const result = await pool.query(
+      `INSERT INTO users (name, email, phone, role, password_hash)
+       VALUES ($1, $2, $3, 'candidate', $4)
+       RETURNING id, name, email, phone, role`,
+      [name, email, phone, passwordHash]
+    );
+
+    // Immediately issue a JWT so they land on dashboard
+    // without needing a separate login step after registering
+    const token = jwt.sign(
+      { userId: result.rows[0].id, role: 'candidate', name: result.rows[0].name },
+      process.env.JWT_SECRET,
+      { expiresIn: '8h' }
+    );
+
+    res.status(201).json({ token, user: result.rows[0] });
+
+  } catch (err) {
+    console.error('Register error:', err.message);
+    res.status(500).json({ error: 'Registration failed' });
+  }
+});
+
 export default router;

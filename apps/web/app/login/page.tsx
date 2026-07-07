@@ -113,6 +113,15 @@ export default function LoginPage() {
             {loading ? 'Signing in...' : 'Sign in'}
           </button>
         </form>
+        <p style={{ textAlign: 'center', fontSize: 13, color: '#6B7280', margin: 0 }}>
+          New candidate?{' '}
+          <span
+            onClick={() => router.push('/register')}
+            style={{ color: '#1D4ED8', cursor: 'pointer', fontWeight: 500 }}
+          >
+            Register here
+          </span>
+        </p>
       </div>
     </div>
   );
