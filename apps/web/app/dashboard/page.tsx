@@ -12,7 +12,7 @@ interface AssignedTest {
   attempt_status: string;
   score?: number;
   attempt_id?: string;
-  can_view_results?: boolean;
+  show_responses_to_employee?: boolean;
 }
 
 export default function DashboardPage() {
@@ -162,7 +162,7 @@ function TestCard({
       <p style={styles.cardMeta}>{test.duration_minutes} minutes</p>
 
       {completed ? (
-        test.can_view_results ? (
+        test.show_responses_to_employee ? (
           <button
             onClick={() => router?.push(`/results/${test.attempt_id}`)}
             style={{ ...styles.actionBtn, backgroundColor: accentColor }}
