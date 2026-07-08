@@ -711,4 +711,225 @@ router.post(
 );
 
 
+// ── Helper — checks for in-progress attempts before allowing edits ──
+async function checkNoActiveAttempts(pool, testId, res) {
+  const active = await pool.query(
+    `SELECT COUNT(*) as count FROM attempts 
+     WHERE test_id = $1 AND submit_status = 'in_progress'`,
+    [testId]
+  );
+  if (parseInt(active.rows[0].count) > 0) {
+    res.status(409).json({
+      error: `Cannot edit this test — ${active.rows[0].count} candidate(s) are currently taking it. Wait for them to finish or terminate their attempts first.`,
+    });
+    return false;
+  }
+  return true;
+}
+
+// PATCH /admin/tests/:id
+// Edit test metadata — title, description, duration, type, show_responses,
+// shuffle_questions. Blocked if any attempt is in_progress.
+router.patch('/tests/:id', requireAuth, requireRole('admin'), async (req, res) => {
+  const { pool } = req.app.locals;
+  const { id: testId } = req.params;
+  const {
+    title,
+    description,
+    duration_minutes,
+    pass_percentage,
+    shuffle_questions,
+    test_type,
+    show_responses_to_employee,
+  } = req.body;
+
+  try {
+    const testCheck = await pool.query(`SELECT * FROM tests WHERE id = $1`, [testId]);
+    if (testCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Test not found' });
+    }
+
+    if (!(await checkNoActiveAttempts(pool, testId, res))) return;
+
+    // Enforce the internal/external rule at update time too
+    const effectiveType = test_type ?? testCheck.rows[0].test_type;
+    const effectiveShowResponses = show_responses_to_employee ?? testCheck.rows[0].show_responses_to_employee;
+    if (effectiveType === 'external' && effectiveShowResponses) {
+      return res.status(400).json({ error: 'External tests cannot show responses to candidates' });
+    }
+
+    const result = await pool.query(
+      `UPDATE tests SET
+        title = COALESCE($1, title),
+        description = COALESCE($2, description),
+        duration_minutes = COALESCE($3, duration_minutes),
+        pass_percentage = COALESCE($4, pass_percentage),
+        shuffle_questions = COALESCE($5, shuffle_questions),
+        test_type = COALESCE($6, test_type),
+        show_responses_to_employee = COALESCE($7, show_responses_to_employee)
+       WHERE id = $8
+       RETURNING *`,
+      [title, description, duration_minutes, pass_percentage,
+       shuffle_questions, test_type, show_responses_to_employee, testId]
+    );
+
+    res.json({ test: result.rows[0] });
+
+  } catch (err) {
+    console.error('Edit test error:', err.message);
+    res.status(500).json({ error: 'Failed to update test' });
+  }
+});
+
+// DELETE /admin/tests/:id
+// Deletes an entire test and its related questions, assignments, attempts,
+// responses, and attempt events through existing ON DELETE CASCADE constraints.
+// Blocked if any attempt is currently in progress.
+router.delete('/tests/:id', requireAuth, requireRole('admin'), async (req, res) => {
+  const { pool } = req.app.locals;
+  const { id: testId } = req.params;
+
+  try {
+    const testCheck = await pool.query(`SELECT id, title FROM tests WHERE id = $1`, [testId]);
+    if (testCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Test not found' });
+    }
+
+    if (!(await checkNoActiveAttempts(pool, testId, res))) return;
+
+    await pool.query(`DELETE FROM tests WHERE id = $1`, [testId]);
+
+    res.json({ deleted: true, test: testCheck.rows[0] });
+
+  } catch (err) {
+    console.error('Delete test error:', err.message);
+    res.status(500).json({ error: 'Failed to delete test' });
+  }
+});
+
+// POST /admin/tests/:id/questions
+// Add a new question to an existing test.
+// Blocked if any attempt is in_progress.
+router.post('/tests/:id/questions', requireAuth, requireRole('admin'), async (req, res) => {
+  const { pool } = req.app.locals;
+  const { id: testId } = req.params;
+  const { question_text, option_a, option_b, option_c, option_d, correct_option, marks } = req.body;
+
+  if (!question_text || !option_a || !option_b || !option_c || !option_d) {
+    return res.status(400).json({ error: 'All question fields are required' });
+  }
+  if (!['a', 'b', 'c', 'd'].includes(correct_option)) {
+    return res.status(400).json({ error: 'correct_option must be a, b, c, or d' });
+  }
+
+  try {
+    const testCheck = await pool.query(`SELECT id FROM tests WHERE id = $1`, [testId]);
+    if (testCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Test not found' });
+    }
+
+    if (!(await checkNoActiveAttempts(pool, testId, res))) return;
+
+    // Place new question at the end — get current max order_index
+    const maxOrder = await pool.query(
+      `SELECT COALESCE(MAX(order_index), -1) as max FROM questions WHERE test_id = $1`,
+      [testId]
+    );
+    const nextIndex = parseInt(maxOrder.rows[0].max) + 1;
+
+    const result = await pool.query(
+      `INSERT INTO questions
+        (test_id, question_text, option_a, option_b, option_c, option_d, correct_option, marks, order_index)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING *`,
+      [testId, question_text, option_a, option_b, option_c, option_d,
+       correct_option, marks || 1, nextIndex]
+    );
+
+    res.status(201).json({ question: result.rows[0] });
+
+  } catch (err) {
+    console.error('Add question error:', err.message);
+    res.status(500).json({ error: 'Failed to add question' });
+  }
+});
+
+// PATCH /admin/tests/:id/questions/:qid
+// Edit an existing question's text, options, correct answer, or marks.
+// Blocked if any attempt is in_progress.
+router.patch('/tests/:id/questions/:qid', requireAuth, requireRole('admin'), async (req, res) => {
+  const { pool } = req.app.locals;
+  const { id: testId, qid: questionId } = req.params;
+  const { question_text, option_a, option_b, option_c, option_d, correct_option, marks } = req.body;
+
+  if (correct_option && !['a', 'b', 'c', 'd'].includes(correct_option)) {
+    return res.status(400).json({ error: 'correct_option must be a, b, c, or d' });
+  }
+
+  try {
+    if (!(await checkNoActiveAttempts(pool, testId, res))) return;
+
+    const result = await pool.query(
+      `UPDATE questions SET
+        question_text = COALESCE($1, question_text),
+        option_a = COALESCE($2, option_a),
+        option_b = COALESCE($3, option_b),
+        option_c = COALESCE($4, option_c),
+        option_d = COALESCE($5, option_d),
+        correct_option = COALESCE($6, correct_option),
+        marks = COALESCE($7, marks)
+       WHERE id = $8 AND test_id = $9
+       RETURNING *`,
+      [question_text, option_a, option_b, option_c, option_d,
+       correct_option, marks, questionId, testId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Question not found' });
+    }
+
+    res.json({ question: result.rows[0] });
+
+  } catch (err) {
+    console.error('Edit question error:', err.message);
+    res.status(500).json({ error: 'Failed to update question' });
+  }
+});
+
+// DELETE /admin/tests/:id/questions/:qid
+// Delete a question from an existing test.
+// Blocked if any attempt is in_progress.
+// Also blocked if this is the last question — a test must have at least one.
+router.delete('/tests/:id/questions/:qid', requireAuth, requireRole('admin'), async (req, res) => {
+  const { pool } = req.app.locals;
+  const { id: testId, qid: questionId } = req.params;
+
+  try {
+    if (!(await checkNoActiveAttempts(pool, testId, res))) return;
+
+    const countResult = await pool.query(
+      `SELECT COUNT(*) as count FROM questions WHERE test_id = $1`,
+      [testId]
+    );
+    if (parseInt(countResult.rows[0].count) <= 1) {
+      return res.status(400).json({ error: 'Cannot delete the last question — a test must have at least one question' });
+    }
+
+    const result = await pool.query(
+      `DELETE FROM questions WHERE id = $1 AND test_id = $2 RETURNING id`,
+      [questionId, testId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Question not found' });
+    }
+
+    res.json({ deleted: true, id: questionId });
+
+  } catch (err) {
+    console.error('Delete question error:', err.message);
+    res.status(500).json({ error: 'Failed to delete question' });
+  }
+});
+
 export default router;
