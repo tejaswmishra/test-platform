@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { sharedStyles as s } from './sharedStyles';
+import EditTestModal from './EditTestModal';
 
 interface TestSummary {
   id: string;
@@ -33,6 +34,7 @@ export default function TestsTab() {
   const [loading, setLoading] = useState(true);
   const [showCreateForm, setShowCreateForm] = useState(false);
   const [assigningTestId, setAssigningTestId] = useState<string | null>(null);
+  const [editingTestId, setEditingTestId] = useState<string | null>(null);
 
   useEffect(() => {
     loadTests();
@@ -105,6 +107,16 @@ export default function TestsTab() {
                     </span>
                   </td>
                   <td style={s.td}>
+                    <div style={{ display: 'flex', gap: 6 }}>
+                      <button onClick={() => setEditingTestId(t.id)} style={s.secondaryBtn}>
+                        Edit
+                      </button>
+                      <button onClick={() => setAssigningTestId(t.id)} style={s.secondaryBtn}>
+                        Assign
+                      </button>
+                    </div>
+                  </td>
+                  <td style={s.td}>
                     <button onClick={() => setAssigningTestId(t.id)} style={s.secondaryBtn}>
                       Assign
                     </button>
@@ -127,6 +139,15 @@ export default function TestsTab() {
         <AssignTestModal
           testId={assigningTestId}
           onClose={() => setAssigningTestId(null)}
+        />
+      )}
+
+
+      {editingTestId && (
+        <EditTestModal
+          testId={editingTestId}
+          onClose={() => setEditingTestId(null)}
+          onSaved={() => { setEditingTestId(null); loadTests(); }}
         />
       )}
     </div>

@@ -1,315 +1,362 @@
-# Test Platform — Project Context
+# SProbe — Samsung Assessment Portal
+# Project Context v2
 
-> Internal recruitment + employee training test platform for Samsung.
-> Two interfaces: Client (candidates/employees taking tests) and Admin (creating/managing tests).
+> Enterprise recruitment and employee training test platform for Samsung.
+> This is a PRODUCTION-GRADE system — reliability, security, and data integrity are paramount.
+> Any failure reflects on Samsung's brand directly.
+
+---
+
+## Platform Name
+**SProbe** (Samsung + Probe) — internal working name, subject to approval.
+
+---
 
 ## Tech Stack
+- **Frontend:** Next.js (App Router), TypeScript, custom inline styles
+- **Backend:** Express.js (v5), Node.js ES Modules
+- **Database:** PostgreSQL — LOCAL instance on office LAN (NOT Neon cloud — network is restricted)
+- **Auth:** JWT (jsonwebtoken backend, jose frontend), httpOnly cookies
+- **Process manager:** PM2 in cluster mode (one process per CPU core)
+- **Reverse proxy:** Nginx (in front of Node — handles static files, connection queuing)
+- **Encryption:** AES-256-GCM for question text at rest (NOT bcrypt — bcrypt is one-way, wrong for this)
 
-- **Frontend:** Next.js (App Router), TypeScript, no external UI library — custom inline styles
-- **Backend:** Express.js (v5), Node.js, ES Modules (`"type": "module"` in package.json)
-- **Database:** PostgreSQL hosted on Neon (serverless cloud — accessible from any machine)
-- **Auth:** JWT (`jsonwebtoken` on backend, `jose` for Edge-compatible verification in Next.js proxy.ts)
-- **File generation:** `exceljs` for Excel template download + results export
-- **File upload:** `multer` (memory storage, for parsing bulk question Excel uploads)
-- **Process manager (production):** PM2
+---
 
-## Repository
+## Infrastructure Reality
+- **Network:** Closed office LAN. Nothing leaves the building. No cloud services reachable.
+- **Database:** Local PostgreSQL on a dedicated PC on the LAN (separate from app server)
+- **NOT Kubernetes** — wrong tool for this scale. PM2 cluster + Nginx achieves the same resilience with far less complexity on modest hardware.
+- **Recommended setup:** 2 PCs — one for Express+Next.js (PM2 cluster), one for PostgreSQL
+- **Scale target:** 500 concurrent candidates during recruitment sessions
 
-Private GitHub repo: https://github.com/tejaswmishra/test-platform
+---
 
-## Repository Structure
+## Roles (4 total)
 
-```
-test-platform/
-├── apps/
-│   ├── api/                          ← Express backend
-│   │   ├── index.js                  ← entry point, pool config (max:20), mounts all routers
-│   │   ├── middleware/
-│   │   │   ├── auth.js               ← requireAuth, requireRole
-│   │   │   └── antiCheat.js          ← validateAttempt, calculateScore, autoSubmitOnTimeout
-│   │   ├── routes/
-│   │   │   ├── auth.js               ← POST /auth/login
-│   │   │   ├── admin.js              ← all admin routes (see below)
-│   │   │   ├── tests.js              ← GET /tests/assigned
-│   │   │   └── attempts.js           ← start, answer, status, submit, events, results
-│   │   └── db/
-│   │       ├── migrate.js            ← creates all tables, run once per fresh DB
-│   │       └── seed.js               ← creates default admin account, idempotent
-│   └── web/                          ← Next.js frontend
-│       ├── proxy.ts                  ← route protection, verifies JWT cookie (root level!)
-│       ├── app/
-│       │   ├── api/
-│       │   │   ├── auth/login/route.ts          ← proxies to Express, sets httpOnly cookie
-│       │   │   ├── auth/logout/route.ts         ← deletes cookie
-│       │   │   ├── proxy/[...path]/route.ts     ← forwards JSON API calls with Bearer token
-│       │   │   └── admin/questions/parse-upload/route.ts  ← dedicated multipart upload route
-│       │   ├── login/page.tsx                   ← candidate/employee login (toggle)
-│       │   ├── admin/
-│       │   │   ├── login/page.tsx               ← separate admin login (dark styling)
-│       │   │   ├── dashboard/page.tsx            ← tabbed admin shell
-│       │   │   └── components/
-│       │   │       ├── sharedStyles.ts
-│       │   │       ├── CandidatesTab.tsx
-│       │   │       ├── EmployeesTab.tsx
-│       │   │       ├── TestsTab.tsx              ← includes CreateTestModal + AssignTestModal
-│       │   │       └── ResponsesTab.tsx
-│       │   ├── dashboard/page.tsx               ← candidate/employee dashboard
-│       │   ├── test/[attemptId]/page.tsx         ← test-taking UI
-│       │   └── results/[attemptId]/page.tsx      ← results breakdown (internal tests only)
-│       ├── hooks/
-│       │   └── useAntiCheat.js
-│       └── lib/
-│           └── auth.ts
-├── .gitignore
-└── README.md
-```
+### admin
+- Full access to everything
+- Creates recruiter accounts (must have @samsung.com email + company ID)
+- Views all responses, all tests, all users
+- Can edit any test regardless of who created it
+
+### recruiter
+- Company employee (@samsung.com email + company ID required)
+- Can create tests and edit/delete ONLY their own tests (ownership enforced server-side)
+- Cannot manage users (no access to candidates/employees list)
+- Cannot view other recruiters' test responses
+- Future: will be able to assign tests to candidates
+
+### employee
+- Takes internal training tests
+- Sees analytics dashboard (skills overview, level, history)
+- Can view results for internal tests where show_responses_to_employee = true
+
+### candidate
+- Self-registers on test day (name, email, phone, own password)
+- Takes external recruitment tests
+- Simple dashboard — no analytics, no score visibility
+- Test assigned by admin/recruiter after registration
+
+---
 
 ## Complete Database Schema
 
 ### users
-`id` UUID PK, `name`, `email` (nullable), `phone` (nullable), `company_id` (nullable), `role` (`candidate`|`employee`|`admin`), `password_hash` (bcrypt), `created_at` TIMESTAMPTZ
+id UUID PK, name, email (nullable), phone (nullable), company_id (nullable),
+role ('candidate'|'employee'|'admin'|'recruiter'),
+password_hash (bcrypt), created_at TIMESTAMPTZ
 
 ### tests
-`id` UUID PK, `title`, `description`, `duration_minutes`, `pass_percentage` (default 60), `shuffle_questions` (bool), `is_active` (bool), `test_type` (`internal`|`external`, default `external`), `show_responses_to_employee` (bool, default false), `created_by` FK→users, `created_at` TIMESTAMPTZ
-Constraint: `CHECK (NOT (test_type = 'external' AND show_responses_to_employee = true))`
+id UUID PK, title, description, duration_minutes, pass_percentage (default 60),
+shuffle_questions (bool), is_active (bool),
+test_type ('internal'|'external', default 'external'),
+show_responses_to_employee (bool, default false),
+created_by FK→users, created_at TIMESTAMPTZ
+Constraint: CHECK (NOT (test_type = 'external' AND show_responses_to_employee = true))
 
 ### questions
-`id` UUID PK, `test_id` FK→tests (CASCADE DELETE), `question_text`, `option_a/b/c/d`, `correct_option` (char a-d), `marks`, `order_index`, `created_at` TIMESTAMPTZ
+id UUID PK, test_id FK→tests (CASCADE DELETE),
+question_text TEXT (AES-256-GCM ENCRYPTED),
+option_a TEXT (ENCRYPTED), option_b TEXT (ENCRYPTED),
+option_c TEXT (ENCRYPTED), option_d TEXT (ENCRYPTED),
+correct_option CHAR(1) (ENCRYPTED),
+topic VARCHAR(100),  ← NOT shown to candidates, admin analytics only
+difficulty ('beginner'|'intermediate'|'advanced'),
+marks INT, order_index INT, created_at TIMESTAMPTZ
 
 ### test_assignments
-`id` UUID PK, `test_id` FK, `user_id` FK, `assigned_at` TIMESTAMPTZ, `attempt_status` (`pending`|`in_progress`|`submitted`)
-Constraint: `UNIQUE(test_id, user_id)`
+id UUID PK, test_id FK, user_id FK, assigned_at TIMESTAMPTZ,
+attempt_status ('pending'|'in_progress'|'submitted')
+Constraint: UNIQUE(test_id, user_id)
 
 ### attempts
-`id` UUID PK, `test_id` FK, `user_id` FK, `started_at` TIMESTAMPTZ, `submitted_at` TIMESTAMPTZ, `score`, `submit_status`, `submit_reason` (`manual`|`tab_switch`|`timeout`|`admin_terminated`|etc), `is_voided` (bool), `question_order` (JSONB — shuffled question ID array), `option_order` (JSONB — per-question option shuffle map), `created_at` TIMESTAMPTZ
+id UUID PK, test_id FK, user_id FK,
+started_at TIMESTAMPTZ, submitted_at TIMESTAMPTZ,
+score INT, submit_status, submit_reason,
+is_voided BOOL, question_order JSONB, option_order JSONB,
+session_token UUID,  ← single session enforcement
+created_at TIMESTAMPTZ
 
 ### responses
-`id` UUID PK, `attempt_id` FK, `question_id` FK, `selected_option` (char a-d, NULLABLE), `marked_for_review` (bool, default false), `answered_at` TIMESTAMPTZ
-Constraint: `UNIQUE(attempt_id, question_id)`
+id UUID PK, attempt_id FK, question_id FK,
+selected_option CHAR(1) NULLABLE, marked_for_review BOOL,
+answered_at TIMESTAMPTZ
+Constraint: UNIQUE(attempt_id, question_id)
 
 ### attempt_events
-`id` UUID PK, `attempt_id` FK, `event_type`, `occurred_at` TIMESTAMPTZ, `metadata` JSONB
+id UUID PK, attempt_id FK, event_type, occurred_at TIMESTAMPTZ, metadata JSONB
 
-## All Backend Routes
+---
 
-### Auth
-- `POST /auth/login` — body: `{ userType, email|company_id, password }` → returns JWT + user
+## Security Requirements
 
-### Admin (all require `requireAuth + requireRole('admin')`)
-- `POST /admin/candidates` — creates candidate with temp password
-- `GET /admin/candidates` — lists all candidates
-- `POST /admin/employees` — creates employee with company_id + temp password
-- `GET /admin/employees` — lists all employees
-- `POST /admin/tests` — creates test + questions in a single DB transaction
-- `GET /admin/tests` — lists all tests with question count
-- `GET /admin/tests/:id` — single test with full questions (includes correct_option — admin only)
-- `POST /admin/tests/:id/assign` — body: `{ mode: 'specific'|'all', user_ids?, roles? }`
-- `GET /admin/tests/:id/assignments` — who's assigned, with attempt_status
-- `POST /admin/tests/:id/terminate` — body: `{ user_id }` — voids in-progress attempt
-- `POST /admin/tests/:id/restart` — body: `{ user_id }` — voids all attempts, resets to pending
-- `GET /admin/tests/:id/export` — streams .xlsx file (flat sheet, one row per candidate, Q1/Q2... columns)
-- `GET /admin/question-template` — streams blank .xlsx template for bulk upload
-- `POST /admin/questions/parse-upload` — multer file upload, parses + validates, returns preview (does NOT save to DB)
+### Question Encryption
+- All question text, options, and correct_option stored AES-256-GCM encrypted in DB
+- Encryption key in .env as QUESTION_ENCRYPTION_KEY (32-byte hex)
+- Decrypt at read time in Express, never store plaintext
+- Candidates NEVER receive correct_option in any response (existing rule, maintained)
 
-### Candidate/Employee
-- `GET /tests/assigned` — returns `{ pending, inProgress, completed }` arrays, each item includes `can_view_results` boolean
-- `POST /attempts/start` — body: `{ test_id }` — starts or resumes attempt, returns questions (no correct_option), optionOrder, test metadata
-- `PATCH /attempts/:id/answer` — body: `{ question_id, selected_option, marked_for_review? }` — rate limited (20/min per userId)
-- `GET /attempts/:id/answers` — all saved answers for this attempt
-- `GET /attempts/:id/status` — 4-state status list for pagination grid
-- `POST /attempts/:id/submit` — body: `{ reason }` — scores + closes attempt
-- `POST /attempts/:id/events` — logs cheat event (skips validateAttempt intentionally)
-- `GET /attempts/:id/results` — full breakdown, gated: internal + show_responses_to_employee=true + role=employee only
+### Single Session Enforcement
+- attempts.session_token generated on /attempts/start, returned to client
+- Client sends X-Session-Token header on every write request
+- If token mismatch → 409 SESSION_CONFLICT error
+- Prevents same attempt being active in two browser windows simultaneously
 
-## Key Architectural Decisions
+### DevTools and Right-click Prevention
+- Disabled on test page only (not on login/dashboard)
+- Blocks: F12, Ctrl+Shift+I, Ctrl+Shift+J, Ctrl+U, right-click context menu
+- Lives in useAntiCheat.js, active only when isActive=true
+- This is friction, not true security — real security is server-side (correct_option never sent)
 
-1. **JWT payload identical for all 3 roles** — `{ userId, role, name }`. Role enforcement via `requireRole` middleware, not separate auth systems.
+### Recruiter Access Control
+- requireTestOwnership middleware: admins bypass, recruiters only touch their own tests
+- @samsung.com email validation at recruiter creation time
+- Recruiters cannot access /admin/candidates, /admin/employees, or any responses routes
 
-2. **Server-side timer is source of truth.** `validateAttempt` middleware recalculates elapsed time from `started_at` on every write request. Auto-submits and scores right in the middleware if expired, before route handler runs.
+---
 
-3. **Candidates never receive `correct_option`.** `getQuestionsInOrder` helper explicitly excludes it. Admin routes include it.
+## Question Topic Tags
+- questions.topic (VARCHAR 100) — e.g. "AI Tools", "Test Automation", "Data Engineering", "Gen AI"
+- questions.difficulty ('beginner'|'intermediate'|'advanced')
+- Topics NEVER sent to candidates in any API response
+- Admin analytics query groups responses by topic to show accuracy per topic
+- Used for employee skill level calculation
 
-4. **Per-candidate question AND option shuffle, both saved once at attempt creation.** `question_order` = shuffled question ID array. `option_order` = `{ questionId: ['c','a','d','b'] }` map. Both saved to `attempts` row permanently. Resume always reads saved order — never reshuffles mid-attempt. Frontend translates clicked display position back to original letter before sending to backend — scoring logic never needs to know shuffling exists.
+---
 
-5. **Anti-cheat is split across frontend + backend deliberately:**
-   - Frontend (`useAntiCheat` hook): `visibilitychange`, `blur`/`focus`, `beforeunload` listeners detect tab-switches and call `/attempts/:id/submit`
-   - Backend (`validateAttempt`): gatekeeper on every write — ownership, status, timer. Fires regardless of frontend behavior.
-   - `/attempts/:id/events` deliberately skips `validateAttempt` — audit log should record even if attempt already closed.
+## Employee Skill Level Algorithm
+Based on average score percentage across ALL completed internal tests:
+- Beginner: avg < 50%
+- Intermediate: avg 50-79%
+- Advanced: avg >= 80%
+Computed at query time, no stored column needed.
 
-6. **httpOnly cookie auth bridged to Bearer tokens via proxy.**
-   - `/api/auth/login/route.ts` — sets httpOnly cookie, browser JS never sees raw JWT
-   - `/api/proxy/[...path]/route.ts` — all JSON API calls go here, reads cookie, attaches Bearer header to Express request
-   - `/api/admin/questions/parse-upload/route.ts` — DEDICATED upload route, bypasses generic proxy entirely. Generic proxy buffers body as text which corrupts multipart streams ("Unexpected end of form"). This route streams `req.body` directly to Express with the original Content-Type header (including boundary string) preserved.
+---
 
-7. **Admin login is a separate page (`/admin/login`).** Not linked from public candidate login page. Distinct dark visual styling.
+## Employee Dashboard UI (3-tab layout)
 
-8. **Internal vs External test types — 3-layer enforcement:**
-   - DB constraint: `CHECK (NOT (test_type = 'external' AND show_responses_to_employee = true))`
-   - Creation-time: `POST /admin/tests` rejects invalid combination with 400
-   - Access-time: `GET /attempts/:id/results` re-checks `test_type`, `show_responses_to_employee`, AND `req.user.role === 'employee'` — candidates can never see results even if assigned to an internal test
+### Header
+- SProbe logo + platform name (left)
+- Tab navigation: Dashboard | Level Tests | Test History (center)
+- User name + sign out (right)
 
-9. **Connection pool sized for 500 concurrent candidates.** `pg.Pool({ max: 20, idleTimeoutMillis: 30000, connectionTimeoutMillis: 5000 })`. Frontend auto-save every 20s (not per-click) keeps simultaneous writes manageable.
+### Tab 1: Dashboard
+Skills Overview card (top):
+- Tests taken | Avg score | Current level (Beginner/Intermediate/Advanced)
+- Defaults: 0 tests, 0%, Beginner if no tests completed
+- Visual skill breakdown by topic (bar chart per topic accuracy)
 
-10. **Rate limiter keys by userId, not IP.** `keyGenerator: (req) => req.user?.userId || ipKeyGenerator(req)`. `requireAuth` runs BEFORE `answerLimiter` in the middleware chain so `req.user` exists. Uses `ipKeyGenerator` helper (not raw `req.ip`) to avoid IPv6 bypass and suppress the ERR_ERL_KEY_GEN_IPV6 warning.
+Pending/Assigned Tests section (middle):
+- Cards for tests yet to be taken
 
-11. **Terminate keeps data, Restart voids attempts.** Terminate: marks in-progress attempt as `submitted + is_voided=true + submit_reason='admin_terminated'`. Restart: voids ALL existing attempts for that test+user, resets `test_assignments.attempt_status` to `'pending'`. Resume logic in `/attempts/start` naturally creates a fresh attempt since voided attempts don't match the `submit_status='in_progress'` check.
+Completed Tests section (bottom):
+- Filter bar: Status (Pass/Fail), Skill/Topic, Level, Test Name, Date range (from→to)
+- Table of completed tests with all filter fields
+- Copyright footer
 
-12. **Dashboard LEFT JOIN uses subquery to get only the latest non-voided attempt.** Prevents duplicate rows in `completed` array when a user has multiple historical attempts (after restart+recompletion). React key collision (`Encountered two children with the same key`) was the symptom.
+### Tab 2: Level Tests
+- Tests organized by difficulty level
+- Shows which level the employee is currently at
+- Recommended next tests based on weak topics
 
-13. **Bulk upload does NOT save to DB.** `POST /admin/questions/parse-upload` only parses and validates, returning a preview. Admin confirms in the UI, then the normal `POST /admin/tests` is called with those questions in the body — same path as manual entry.
+### Tab 3: Test History
+- Full history with detailed per-test analytics
+- View Results button for eligible tests
 
-## What's Fully Built and Verified
+---
+
+## Candidate Dashboard (unchanged — simple)
+- Pending tests → Start Test button
+- In-progress → Resume Test button
+- Completed → "Submitted" label only (no scores, no results)
+- No analytics, no skill tracking
+
+---
+
+## Bulk Question Import (Paste Format)
+Admin pastes questions in this exact format into a textarea:
+
+```
+Q1. What is HTML?
+a) Hyper Text Markup Language      b) jsjs
+c) ahah.         d) hahaha
+correct option : a)
+
+Q2. What does CSS stand for?
+a) Cascading Style Sheets
+b) Computer Style Sheets
+c) Creative Style System
+d) Colorful Style Sheets
+correct option : a)
+```
+
+Parser splits on Q\d+\. boundaries, extracts options by splitting on b)/c)/d) boundaries
+within the options block, extracts correct_option from "correct option : x)" line.
+All parsing client-side via regex, no LLM, no file upload, no DRM issues.
+After parsing, questions shown in preview. Admin confirms → POST /admin/tests fires
+with parsed questions in body, same as manual entry.
+
+---
+
+## What's Fully Built (from v1)
 
 ### Backend
-- [x] Auth (all 3 roles), JWT issuance, bcrypt password hashing
-- [x] requireAuth + requireRole middleware
-- [x] validateAttempt anti-cheat middleware (ownership, status, server-side timer, auto-submit)
-- [x] Admin: create candidates/employees, create tests (transaction), assign tests, view assignments
-- [x] Admin: terminate attempt, allow restart
-- [x] Admin: Excel export (flat sheet, dynamic question columns with full question text)
-- [x] Admin: question template download, bulk upload parse + validate (preview only, no DB save)
-- [x] Candidate/employee: view assigned tests, start/resume attempts, save/clear answers, review flags, question status, submit + scoring
-- [x] Internal/external test types with 3-layer visibility enforcement
-- [x] Results route gated by test_type + show_responses_to_employee + role=employee
-- [x] Rate limiting on /answer route (userId-keyed, 20/min)
-- [x] Seed script for default admin
+- Auth (login for candidate/employee/admin), JWT, bcrypt passwords
+- requireAuth + requireRole middleware
+- validateAttempt anti-cheat middleware (ownership, status, timer)
+- Admin: CRUD candidates, CRUD employees, create/edit/delete tests + questions
+- Admin: assign tests, view assignments, terminate/restart attempts
+- Admin: Excel export (flat sheet, Q1/Q2... columns with full question text)
+- Candidate self-registration (POST /auth/register)
+- GET /auth/me — returns logged-in user info
+- Test-taking: start/resume (with shuffle), save answers, review flags, status, submit+score
+- Internal/external test type with 3-layer visibility enforcement
+- Results route (gated: internal + show_responses + role=employee only)
+- Rate limiting on /answer (userId-keyed, 20/min)
 
 ### Frontend
-- [x] `/login` — candidate/employee toggle
-- [x] `/admin/login` — separate dark-styled page
-- [x] `/dashboard` — pending/in-progress/completed cards, conditional View Results button
-- [x] `/test/[attemptId]` — full test-taking UI: shuffled options, 4-color pagination grid, timer, Previous/Next/Clear/Mark for Review/Submit, auto-save (20s interval + flush on navigation + retry on failure)
-- [x] `/results/[attemptId]` — full breakdown for eligible employees
-- [x] `/admin/dashboard` — 4-tab UI: Tests, Candidates, Employees, Responses
-- [x] Tests tab: create form (internal/external toggle, question builder with click-to-select-correct UX, Manual/Bulk Upload tab switcher), test list, Assign modal with today-filter
-- [x] Candidates/Employees tabs: register forms, credentials modal, tables, today-filter
-- [x] Responses tab: status table, Terminate/Restart actions, Export Excel button
-- [x] Dedicated upload route (`/api/admin/questions/parse-upload/route.ts`) streaming multipart directly to Express
-- [x] Generic proxy handles binary responses (Excel download) correctly via arrayBuffer passthrough
-- [x] `useAntiCheat` hook: visibilitychange, blur/focus with popup detection, beforeunload
+- /login (candidate/employee toggle), /admin/login (dark theme), /register
+- /dashboard (role-aware: employees see analytics, candidates see simple cards)
+- /test/[attemptId] (full UI: shuffled questions+options, 4-color pagination, timer, anti-cheat)
+- /results/[attemptId] (breakdown for eligible employees)
+- /admin/dashboard (4 tabs: Tests, Candidates, Employees, Responses)
+- EditTestModal (edit metadata + questions on existing tests)
+- Bulk paste import (textarea, regex parser, no file upload needed)
 
-## What's NOT Done
+---
 
-- [ ] **Deployment** — being set up this week (see below)
-- [ ] No automated tests — all verification done manually via Thunder Client + browser
-- [ ] Bulk upload does not support adding questions to an EXISTING test — only at creation time (deliberate scope decision)
+## What's NOT Done Yet (build order)
 
-## Known Bugs Fixed
+1. **Question encryption (AES-256-GCM)** — schema + encrypt on write + decrypt on read
+2. **Single session enforcement** — session_token on attempts table
+3. **Recruiter role** — new role, ownership middleware, @samsung.com validation
+4. **topic + difficulty columns on questions** — schema + admin UI fields + analytics query
+5. **DevTools/right-click prevention** — add to useAntiCheat.js
+6. **Admin topic analytics dashboard** — responses grouped by topic per test
+7. **Employee dashboard tabs** — Level Tests tab, Test History tab, topic-based filtering
+8. **Nginx config** — reverse proxy setup for production
+9. **PM2 cluster mode config** — ecosystem.config.js
+10. **Local PostgreSQL setup** — replace Neon for production LAN deployment
+11. **Recruiter UI in admin panel** — manage recruiters, recruiter sees only their tests
 
-1. `TIMESTAMP` → `TIMESTAMPTZ` — server-side timer miscalculated by hours due to timezone parsing
-2. Timer `00:00` on resume — resume branch of `/attempts/start` wasn't returning `test.duration_minutes`
-3. TypeScript annotations in `.js` backend file — Node crashed with `SyntaxError: Missing initializer`
-4. `middleware.ts` → `proxy.ts` rename — Next.js 16 deprecation
-5. Generic proxy crashed on Excel binary response — was calling `.json()` on binary bytes; fixed with `arrayBuffer()` passthrough
-6. `.env` in wrong folder — must be `apps/api/.env`, not repo root
-7. Duplicate key React error after restart+recompletion — LEFT JOIN was returning multiple attempt rows; fixed with subquery getting only latest non-voided attempt
-8. Rate limiter IPv6 warning — replaced `req.ip` with `ipKeyGenerator(req)` from express-rate-limit
-9. "Unexpected end of form" on file upload — generic proxy was buffering multipart body as text, corrupting the stream; fixed with dedicated `/api/admin/questions/parse-upload/route.ts` that streams `req.body` directly
-10. Candidates could see internal test results — `can_view_results` and results route both missing `role === 'employee'` check
+---
 
-## Environment Variables
+## Environment Variables (full list)
 
 ### apps/api/.env
 ```
-DATABASE_URL=<neon pooled connection string>
-JWT_SECRET=<32+ char secret, must match web exactly>
+DATABASE_URL=postgresql://postgres:password@localhost:5432/test_platform
+JWT_SECRET=<32+ char secret>
+QUESTION_ENCRYPTION_KEY=<64 char hex string for AES-256>
 PORT=5000
-CLIENT_URL=http://localhost:3000  (dev) | http://<SERVER_IP>:3000 (prod)
+CLIENT_URL=http://<SERVER_IP>:3000
 SEED_ADMIN_EMAIL=admin@samsung.com
-SEED_ADMIN_PASSWORD=<your password>
+SEED_ADMIN_PASSWORD=<strong password>
 SEED_ADMIN_NAME=Samsung Admin
 ```
 
 ### apps/web/.env.local
 ```
-NEXT_PUBLIC_API_URL=http://localhost:5000  (dev) | http://<SERVER_IP>:5000 (prod)
-API_URL=http://localhost:5000  (dev) | http://localhost:5000 (prod — same machine, localhost is correct)
-JWT_SECRET=<MUST match api JWT_SECRET exactly>
+NEXT_PUBLIC_API_URL=http://<SERVER_IP>:5000
+API_URL=http://localhost:5000
+JWT_SECRET=<same as api>
 ```
 
-## Deployment Plan (Windows Office Server, LAN-only)
+---
 
-### One-time server setup
-```bash
-# 1. Install Node.js LTS from nodejs.org
-# 2. Install Git from git-scm.com
-# 3. Clone the repo
-git clone https://github.com/tejaswmishra/test-platform.git
-cd test-platform
+## Deployment Plan (Office LAN, Windows Servers)
 
-# 4. Install dependencies
-cd apps/api && npm install
-cd ../web && npm install
+### PC 1 — Database Server
+- PostgreSQL 16 installed locally
+- Static IP on office LAN
+- Only accessible from PC 2 (firewall rule)
 
-# 5. Create .env files (see Environment Variables above, use SERVER_IP)
-# 6. Run database migration (Neon — already has schema, just verify)
-cd apps/api && node db/migrate.js
-# 7. Seed admin account
-node db/seed.js
+### PC 2 — Application Server
+- Node.js v20 LTS (NOT v24 — v24 has fetch streaming issues with multipart)
+- PM2 in cluster mode: `pm2 start ecosystem.config.js`
+- Nginx on port 80 → proxies to Next.js on 3000
+- Nginx also proxies /api/* to Express on 5000
+- Ports 80 open on Windows Firewall (candidates only need port 80)
 
-# 8. Build Next.js for production
-cd ../web && npm run build
-# Fix any build errors before proceeding
-
-# 9. Install PM2
-npm install -g pm2
-
-# 10. Start both processes
-cd ../api && pm2 start index.js --name "test-platform-api"
-cd ../web && pm2 start npm --name "test-platform-web" -- start
-
-# 11. Save + configure auto-start on boot
-pm2 save
-pm2 startup  # run the command it prints
-
-# 12. Open firewall ports (Windows Defender Firewall → Inbound Rules)
-# Port 3000 TCP — "Test Platform Web"
-# Port 5000 TCP — "Test Platform API"
+### ecosystem.config.js (PM2)
+```javascript
+module.exports = {
+  apps: [
+    {
+      name: 'sprobe-api',
+      script: 'apps/api/index.js',
+      instances: 'max',  // one per CPU core
+      exec_mode: 'cluster',
+      env: { NODE_ENV: 'production' }
+    },
+    {
+      name: 'sprobe-web',
+      script: 'npm',
+      args: 'start',
+      cwd: 'apps/web',
+      instances: 2,
+      exec_mode: 'cluster',
+    }
+  ]
+};
 ```
 
-### Verify deployment
-From another machine on the LAN: `http://<SERVER_IP>:3000` should show login page.
-
-### Updating the deployment after code changes
-```bash
-git pull origin main
-cd apps/api && npm install   # if new packages added
-cd ../web && npm install && npm run build
-pm2 restart all
+### Nginx config (basic)
+```nginx
+server {
+  listen 80;
+  location / { proxy_pass http://localhost:3000; }
+  location /api/ { proxy_pass http://localhost:5000/; }
+}
 ```
 
-## Office TODO for Tomorrow
+---
 
-### Priority 1 — Run production build check AT HOME TONIGHT first
-```bash
-cd apps/web
-npm run build
-```
-Fix any TypeScript/build errors before going to the server. Much easier to debug at home with AI access than on the server under time pressure.
+## Known Bugs Fixed (full list)
+1. TIMESTAMP → TIMESTAMPTZ (timer miscalculated by hours)
+2. Timer 00:00 on resume (resume branch missing test.duration_minutes)
+3. TypeScript annotations in .js backend file (Node crash)
+4. middleware.ts → proxy.ts (Next.js 16 deprecation)
+5. Generic proxy crashed on Excel binary response (arrayBuffer fix)
+6. .env in wrong folder (must be apps/api/.env)
+7. Duplicate key React error after restart+recompletion (LEFT JOIN subquery fix)
+8. Rate limiter IPv6 warning (ipKeyGenerator helper)
+9. "Unexpected end of form" on file upload (dedicated upload route, req.body streaming)
+10. Candidates seeing internal test results (missing role=employee check)
+11. can_view_results field name mismatch in dashboard interface
+12. NASCA DRM encrypts all files saved on office PCs — CSV and XLSX both affected
+    Solution: paste-from-textarea approach, no file ever touches disk
+13. Node v24 fetch streaming incompatibility — use Node v20 LTS for production
 
-### Priority 2 — Server setup (in this exact order)
-1. Install Node.js LTS on the server
-2. Install Git on the server
-3. Clone the repo
-4. `npm install` in both `apps/api` and `apps/web`
-5. Create both `.env` files with the SERVER_IP (not localhost)
-6. `node db/migrate.js` — confirm tables exist on Neon (should already be there)
-7. `node db/seed.js` — creates production admin account
-8. `npm run build` in `apps/web` — must succeed with zero errors
-9. Install PM2 globally
-10. Start both processes with PM2
-11. `pm2 save` + run the `pm2 startup` command
-12. Open ports 3000 and 5000 in Windows Firewall
-13. Test from another LAN machine
+---
 
-### Priority 3 — Full smoke test on production
-- Login as admin → create a test → register a candidate → assign → take test as that candidate → check Responses tab → export Excel
-- Confirm anti-cheat fires correctly (tab switch)
-- Confirm timer works correctly
-
-### Things that can go wrong and how to fix them
-- **Build errors** — TypeScript strict mode surfaces issues dev mode tolerates. Fix the specific file/line the build output points to.
-- **PM2 not found after install** — close and reopen terminal (PATH needs refresh)
-- **Port already in use** — another process is on 3000 or 5000. `netstat -ano | findstr :3000` to find and kill it.
-- **Candidates can't reach the server** — firewall ports not open, or they're using the wrong IP. Confirm with `ipconfig` on the server to get the exact LAN IP.
-- **`pm2 startup` doesn't work on Windows** — PM2's startup command works differently on Windows. Alternative: create a Windows Task Scheduler task to run `pm2 resurrect` on login/startup.
+## Important Architectural Decisions
+1. Correct_option NEVER sent to candidates in any API response
+2. Server-side timer is source of truth (not frontend countdown)
+3. Question/option shuffle saved once on attempt creation, reused on resume
+4. Three-layer enforcement for internal/external test visibility
+5. Rate limiter keys by userId not IP (office LAN shares IP addresses)
+6. Bulk upload is paste-based (no file) due to NASCA DRM on office machines
+7. Local PostgreSQL required (Neon cloud unreachable from office LAN)
+8. PM2 cluster + Nginx preferred over Kubernetes for this scale and hardware

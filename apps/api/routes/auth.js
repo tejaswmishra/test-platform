@@ -126,4 +126,22 @@ router.post('/register', async (req, res) => {
   }
 });
 
+
+// GET /auth/me — returns the logged-in user's basic info from JWT
+router.get('/me', requireAuth, async (req, res) => {
+  const { pool } = req.app.locals;
+  try {
+    const result = await pool.query(
+      `SELECT id, name, email, company_id, role FROM users WHERE id = $1`,
+      [req.user.userId]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch user' });
+  }
+});
+
 export default router;

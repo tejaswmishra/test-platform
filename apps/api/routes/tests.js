@@ -65,4 +65,104 @@ router.get('/assigned', requireAuth, requireRole('candidate', 'employee'), async
   }
 });
 
+// Add this to apps/api/routes/tests.js
+
+// GET /tests/analytics
+// Returns aggregated performance data for the logged-in employee.
+// Candidates hitting this route get a 403 since requireRole blocks them.
+router.get('/analytics', requireAuth, requireRole('employee'), async (req, res) => {
+  const { pool } = req.app.locals;
+  const userId = req.user.userId;
+
+  try {
+    // All submitted, non-voided attempts with test details
+    const attemptsResult = await pool.query(
+      `SELECT 
+         a.id as attempt_id,
+         a.score,
+         a.submitted_at,
+         a.submit_reason,
+         t.id as test_id,
+         t.title,
+         t.pass_percentage,
+         t.show_responses_to_employee,
+         COUNT(q.id) as total_questions,
+         SUM(q.marks) as total_marks
+       FROM attempts a
+       JOIN tests t ON t.id = a.test_id
+       JOIN questions q ON q.test_id = t.id
+       WHERE a.user_id = $1 
+         AND a.submit_status = 'submitted'
+         AND a.is_voided = false
+       GROUP BY a.id, t.id
+       ORDER BY a.submitted_at ASC`,
+      [userId]
+    );
+
+    const attempts = attemptsResult.rows;
+
+    if (attempts.length === 0) {
+      return res.json({
+        summary: { total_completed: 0, average_percentage: 0, best_percentage: 0, pass_rate: 0 },
+        chart_data: [],
+        test_breakdown: [],
+      });
+    }
+
+    // Calculate per-attempt metrics
+    const breakdown = attempts.map(a => {
+      const totalMarks = parseInt(a.total_marks) || 0;
+      const score = a.score || 0;
+      const percentage = totalMarks > 0 ? Math.round((score / totalMarks) * 100) : 0;
+      const passed = percentage >= parseInt(a.pass_percentage);
+
+      return {
+        attempt_id: a.attempt_id,
+        test_id: a.test_id,
+        title: a.title,
+        score,
+        total_marks: totalMarks,
+        percentage,
+        passed,
+        submitted_at: a.submitted_at,
+        submit_reason: a.submit_reason,
+        can_view_results: a.show_responses_to_employee,
+      };
+    });
+
+    // Overall summary
+    const totalCompleted = breakdown.length;
+    const averagePercentage = Math.round(
+      breakdown.reduce((sum, b) => sum + b.percentage, 0) / totalCompleted
+    );
+    const bestPercentage = Math.max(...breakdown.map(b => b.percentage));
+    const passCount = breakdown.filter(b => b.passed).length;
+    const passRate = Math.round((passCount / totalCompleted) * 100);
+
+    // Chart data — score percentage per test in chronological order
+    // for the bar chart on the frontend
+    const chartData = breakdown.map(b => ({
+      label: b.title.length > 20 ? b.title.substring(0, 20) + '...' : b.title,
+      percentage: b.percentage,
+      passed: b.passed,
+      submitted_at: b.submitted_at,
+    }));
+
+    res.json({
+      summary: {
+        total_completed: totalCompleted,
+        average_percentage: averagePercentage,
+        best_percentage: bestPercentage,
+        pass_rate: passRate,
+      },
+      chart_data: chartData,
+      test_breakdown: breakdown,
+    });
+
+  } catch (err) {
+    console.error('Analytics error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch analytics' });
+  }
+});
+
 export default router;
